@@ -362,3 +362,67 @@ fn run_clip_ffmpeg(
     // decoding, so reported positions already start near zero for this clip.
     run_ffmpeg_with_progress(&args, Some(duration_sec), ass_dir.as_deref(), on_progress)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_microsecond_progress_values() {
+        assert_eq!(parse_ffmpeg_progress_time("out_time_us", "1500000"), Some(1.5));
+        assert_eq!(parse_ffmpeg_progress_time("out_time_ms", "250000"), Some(0.25));
+        assert_eq!(parse_ffmpeg_progress_time("out_time_us", " 1000000 "), Some(1.0));
+    }
+
+    #[test]
+    fn parses_clock_progress_values() {
+        assert_eq!(parse_ffmpeg_progress_time("out_time", "00:01:02.5"), Some(62.5));
+        assert_eq!(parse_ffmpeg_progress_time("out_time", "01:00:00"), Some(3600.0));
+    }
+
+    #[test]
+    fn ignores_unknown_or_invalid_progress_keys() {
+        assert_eq!(parse_ffmpeg_progress_time("speed", "1.2x"), None);
+        assert_eq!(parse_ffmpeg_progress_time("out_time_us", "not-a-number"), None);
+        assert_eq!(parse_ffmpeg_progress_time("out_time", "bad"), None);
+    }
+
+    #[test]
+    fn parses_clock_timestamps() {
+        assert_eq!(parse_clock_timestamp("00:00:00.000"), Some(0.0));
+        assert_eq!(parse_clock_timestamp("01:02:03"), Some(3723.0));
+        assert_eq!(parse_clock_timestamp("02:03"), None);
+    }
+
+    #[test]
+    fn escapes_ass_filter_special_characters() {
+        let arg = ass_filter_arg(Path::new("/tmp/a:b,c[d];e\\f.ass")).unwrap();
+        assert_eq!(arg, "ass=filename=a\\:b\\,c\\[d\\]\\;e\\\\f.ass");
+    }
+
+    #[test]
+    fn ass_filter_arg_uses_bare_file_name() {
+        let arg = ass_filter_arg(Path::new("/home/user/project/captions.ass")).unwrap();
+        assert_eq!(arg, "ass=filename=captions.ass");
+    }
+
+    #[test]
+    fn ass_filter_arg_returns_none_without_file_name() {
+        assert_eq!(ass_filter_arg(Path::new("/")), None);
+    }
+
+    #[test]
+    fn absolute_path_keeps_absolute_paths() {
+        assert_eq!(absolute_path(Path::new("/tmp/clip.mp4")), PathBuf::from("/tmp/clip.mp4"));
+    }
+
+    #[test]
+    fn absolute_path_resolves_relative_paths() {
+        assert!(absolute_path(Path::new("clip.mp4")).is_absolute());
+    }
+
+    #[test]
+    fn command_exists_rejects_missing_binary() {
+        assert!(!command_exists("autoshorts-definitely-missing-binary"));
+    }
+}
