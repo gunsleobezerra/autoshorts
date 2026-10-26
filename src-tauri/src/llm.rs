@@ -982,3 +982,217 @@ fn parse_candidate_json(text: &str, min_duration: f64) -> Result<Vec<CandidateDr
     candidates.truncate(10);
     Ok(candidates)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn segment(start: f64, end: f64, speaker: Option<&str>, text: &str) -> TranscriptSegment {
+        TranscriptSegment {
+            start,
+            end,
+            speaker: speaker.map(str::to_string),
+            text: text.to_string(),
+        }
+    }
+
+    #[test]
+    fn normalizes_chat_completions_urls() {
+        assert_eq!(
+            normalize_chat_completions_url(""),
+            "https://api.openai.com/v1/chat/completions"
+        );
+        assert_eq!(
+            normalize_chat_completions_url("http://localhost:1234/v1"),
+            "http://localhost:1234/v1/chat/completions"
+        );
+        assert_eq!(
+            normalize_chat_completions_url("http://localhost:1234/v1/"),
+            "http://localhost:1234/v1/chat/completions"
+        );
+        assert_eq!(
+            normalize_chat_completions_url("https://example.com/v1/chat/completions"),
+            "https://example.com/v1/chat/completions"
+        );
+        assert_eq!(
+            normalize_chat_completions_url("  http://host:8080  "),
+            "http://host:8080/chat/completions"
+        );
+    }
+
+    #[test]
+    fn compact_segments_formats_each_line() {
+        let segments = vec![
+            segment(0.0, 1.5, Some("S1"), "hello"),
+            segment(1.5, 3.0, None, "world"),
+        ];
+        assert_eq!(
+            compact_segments(&segments),
+            "[0.00-1.50] S1: hello\n[1.50-3.00] Speaker: world"
+        );
+    }
+
+    #[test]
+    fn parse_candidate_json_accepts_fenced_object_and_normalizes_scores() {
+        let text = r#"```json
+{"candidates":[
+  {"start":0,"end":40,"score":9,"hook":"A","rationale":"r"},
+  {"start":50,"end":80,"score":0.95,"hook":"B","rationale":"r"},
+  {"start":90,"end":95,"score":1,"hook":"C","rationale":"r"}
+]}
+```"#;
+
+        let drafts = parse_candidate_json(text, 30.0).unwrap();
+        assert_eq!(drafts.len(), 2);
+        assert_eq!(drafts[0].hook, "B");
+        assert_eq!(drafts[0].score, 0.95);
+        assert_eq!(drafts[1].hook, "A");
+        assert!((drafts[1].score - 0.9).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn parse_candidate_json_accepts_root_array() {
+        let text = r#"[{"start":0,"end":45,"score":0.5,"hook":"H","rationale":"R"}]"#;
+        let drafts = parse_candidate_json(text, 30.0).unwrap();
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(drafts[0].end, 45.0);
+    }
+
+    #[test]
+    fn parse_candidate_json_accepts_single_candidate_object() {
+        let text = r#"{"start":10,"end":50,"score":0.7,"hook":"H","rationale":"R"}"#;
+        let drafts = parse_candidate_json(text, 30.0).unwrap();
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(drafts[0].start, 10.0);
+    }
+
+    #[test]
+    fn parse_candidate_json_accepts_alternative_keys() {
+        let text = r#"{"moments":[{"start":0,"end":35,"score":0.4,"hook":"H","rationale":"R"}]}"#;
+        assert_eq!(parse_candidate_json(text, 30.0).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn parse_candidate_json_falls_back_to_shorter_clips() {
+        let text = r#"{"candidates":[{"start":0,"end":10,"score":0.5,"hook":"H","rationale":"R"}]}"#;
+        let drafts = parse_candidate_json(text, 30.0).unwrap();
+        assert_eq!(drafts.len(), 1);
+    }
+
+    #[test]
+    fn parse_candidate_json_drops_clips_without_hooks() {
+        let text = r#"{"candidates":[{"start":0,"end":40,"score":0.5,"hook":"  ","rationale":"R"}]}"#;
+        assert!(parse_candidate_json(text, 30.0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_candidate_json_clamps_and_parses_loose_scores() {
+        let text = r#"{"candidates":[
+            {"start":0,"end":40,"score":150,"hook":"big","rationale":""},
+            {"start":0,"end":40,"score":-2,"hook":"neg","rationale":""},
+            {"start":0,"end":40,"score":"8","hook":"str","rationale":""},
+            {"start":"0","end":"40","hook":"missing","rationale":""}
+        ]}"#;
+
+        let drafts = parse_candidate_json(text, 30.0).unwrap();
+        let by_hook = |hook: &str| drafts.iter().find(|d| d.hook == hook).cloned().unwrap();
+        assert_eq!(by_hook("big").score, 1.0);
+        assert_eq!(by_hook("neg").score, 0.0);
+        assert_eq!(by_hook("str").score, 0.8);
+        assert_eq!(by_hook("missing").score, 0.8);
+        assert_eq!(by_hook("missing").end, 40.0);
+    }
+
+    #[test]
+    fn parse_candidate_json_truncates_to_ten_candidates() {
+        let candidates: Vec<String> = (0..12)
+            .map(|i| format!(r#"{{"start":0,"end":40,"score":0.5,"hook":"h{i}","rationale":""}}"#))
+            .collect();
+        let text = format!(r#"{{"candidates":[{}]}}"#, candidates.join(","));
+        assert_eq!(parse_candidate_json(&text, 30.0).unwrap().len(), 10);
+    }
+
+    #[test]
+    fn parse_candidate_json_rejects_invalid_json() {
+        assert!(parse_candidate_json("not json at all", 30.0).is_err());
+        assert!(parse_candidate_json(r#"{"unrelated":true}"#, 30.0).is_err());
+    }
+
+    #[test]
+    fn parses_sse_streamed_chunks() {
+        let body = concat!(
+            "data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n",
+            "data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n",
+            "data: [DONE]\n"
+        );
+        assert_eq!(parse_sse_stream_text(body).as_deref(), Some("Hello"));
+    }
+
+    #[test]
+    fn rejects_non_chunk_sse_payloads_and_empty_streams() {
+        let not_chunks = "data: {\"object\":\"chat.completion\",\"choices\":[]}\n";
+        assert_eq!(parse_sse_stream_text(not_chunks), None);
+        assert_eq!(parse_sse_stream_text("event: ping\n"), None);
+    }
+
+    #[test]
+    fn extracts_text_from_chat_completion_variants() {
+        let string_content: ChatCompletionResponse = serde_json::from_value(json!({
+            "choices": [{ "message": { "content": "plain" } }]
+        }))
+        .unwrap();
+        assert_eq!(extract_completion_text(&string_content).as_deref(), Some("plain"));
+
+        let parts_content: ChatCompletionResponse = serde_json::from_value(json!({
+            "choices": [{ "message": { "content": [{ "text": "a" }, { "text": "b" }] } }]
+        }))
+        .unwrap();
+        assert_eq!(extract_completion_text(&parts_content).as_deref(), Some("ab"));
+
+        let reasoning: ChatCompletionResponse = serde_json::from_value(json!({
+            "choices": [{ "message": { "content": null, "reasoning_content": "thinking" } }]
+        }))
+        .unwrap();
+        assert_eq!(extract_completion_text(&reasoning).as_deref(), Some("thinking"));
+
+        let legacy_text: ChatCompletionResponse = serde_json::from_value(json!({
+            "choices": [{ "text": "legacy" }]
+        }))
+        .unwrap();
+        assert_eq!(extract_completion_text(&legacy_text).as_deref(), Some("legacy"));
+    }
+
+    #[test]
+    fn extract_completion_text_returns_none_without_content() {
+        let empty: ChatCompletionResponse = serde_json::from_value(json!({ "choices": [] })).unwrap();
+        assert_eq!(extract_completion_text(&empty), None);
+
+        let blank: ChatCompletionResponse = serde_json::from_value(json!({
+            "choices": [{ "message": { "content": "   " } }]
+        }))
+        .unwrap();
+        assert_eq!(extract_completion_text(&blank), None);
+    }
+
+    #[test]
+    fn body_snippet_truncates_long_bodies() {
+        let short = "  short body  ";
+        assert_eq!(body_snippet(short), "short body");
+
+        let long = "x".repeat(900);
+        let snippet = body_snippet(&long);
+        assert_eq!(snippet.chars().count(), 801);
+        assert!(snippet.ends_with('…'));
+    }
+
+    #[test]
+    fn chat_completion_payload_toggles_json_mode() {
+        let with_json = chat_completion_payload("model", "prompt", true);
+        assert_eq!(with_json["response_format"]["type"], "json_object");
+        assert_eq!(with_json["stream"], false);
+
+        let without_json = chat_completion_payload("model", "prompt", false);
+        assert!(without_json.get("response_format").is_none());
+    }
+}
