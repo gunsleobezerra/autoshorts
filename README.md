@@ -168,12 +168,22 @@ cargo test --manifest-path src-tauri/Cargo.toml
 npm run test:rust
 ```
 
-Frontend tests use Vitest + Testing Library with a jsdom environment:
+Frontend tests use Vitest + Testing Library with a jsdom environment, which
+requires **Node 22.19 or newer** (`engines.node` in `package.json`; jsdom 30
+pulls in undici 8, which uses `zlib.createZstdDecompress` and crashes on
+older runtimes):
 
 ```bash
 npm test              # single run
 npm run test:watch    # watch mode
+npm test -- format    # single run, only files matching "format"
 ```
+
+Both `test` scripts go through `scripts/test.mjs`, so `npm run test watch`
+also works: a bare `watch` argument enables watch mode instead of being
+treated as a file-name filter (which Vitest would report as
+`No test files found`). The wrapper also checks the Node version up front
+and exits with a readable message instead of an `undici` stack trace.
 
 Test layout:
 
