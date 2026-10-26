@@ -635,8 +635,16 @@ async fn render_flat_clip_for_candidate(
                 let clips_dir = dir.join("clips");
                 // Name the file after the project, the clip rank and the hook
                 // so the exported videos are identifiable outside the app.
+                // A renamed project wins over the source file stem.
+                let project_label = project
+                    .name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| project_output_slug(&project));
                 let file_name = naming::clip_file_name(
-                    &project_output_slug(&project),
+                    &project_label,
                     candidate.rank,
                     &candidate.hook,
                     candidate.start_sec,
