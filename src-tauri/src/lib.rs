@@ -1389,34 +1389,153 @@ fn build_drawtext_filters(
 }
 
 #[cfg(test)]
-pub mod tests {
+mod tests {
     use super::*;
+    use crate::models::TranscriptWord;
+
+    fn word(text: &str, start: f64, end: f64) -> TranscriptWord {
+        TranscriptWord {
+            text: text.to_string(),
+            start,
+            end,
+            speaker: Some("S1".to_string()),
+        }
+    }
+
+    fn project(source_path: &str) -> Project {
+        Project {
+            id: "project-id".to_string(),
+            name: None,
+            source_path: source_path.to_string(),
+            source_duration: Some(120.0),
+            status: "ingest".to_string(),
+            transcription_mode: "local".to_string(),
+            caption_style: Some("modern-box".to_string()),
+            created_at: "2024-01-01T00:00:00Z".to_string(),
+            updated_at: "2024-01-01T00:00:00Z".to_string(),
+        }
+    }
 
     #[test]
     fn test_build_drawtext_filters_formatting() {
-        let words = vec![
-            TranscriptWord {
-                text: "Hello".to_string(),
-                start: 0.0,
-                end: 1.0,
-                speaker: None,
-            },
-            TranscriptWord {
-                text: "world".to_string(),
-                start: 1.0,
-                end: 2.0,
-                speaker: None,
-            },
-        ];
+        let words = vec![word("Hello", 0.0, 1.0), word("world", 1.0, 2.0)];
 
         let result = build_drawtext_filters(&words, 0.0, 5.0, 1080, "classic-outline");
-
         assert!(!result.is_empty());
         assert!(result.contains("drawtext="));
         assert!(result.contains("text='HELLO WORLD'"));
+
         if result.contains("fontfile=") {
             assert!(result.contains("fontfile='"));
+            assert!(!result.contains("\\:"));
         }
-        assert!(!result.contains("\\:"));
+    }
+
+    #[test]
+    fn format_srt_time_uses_comma_milliseconds() {
+        assert_eq!(format_srt_time(0.0, 1.5), "00:00:00,000 --> 00:00:01,500");
+        assert_eq!(format_srt_time(62.5, 3661.25), "00:01:02,500 --> 01:01:01,250");
+    }
+
+    #[test]
+    fn format_ass_time_uses_centiseconds() {
+        assert_eq!(format_ass_time(0.0), "0:00:00.00");
+        assert_eq!(format_ass_time(62.5), "0:01:02.50");
+        assert_eq!(format_ass_time(3661.5), "1:01:01.50");
+        assert_eq!(format_ass_time(-5.0), "0:00:00.00");
+    }
+
+    #[test]
+    fn generate_srt_chunks_three_words_and_clips_to_window() {
+        let words = vec![
+            word("alpha", 0.0, 0.5),
+            word("beta", 1.0, 1.5),
+            word("gamma", 2.0, 2.5),
+            word("delta", 3.0, 3.5),
+            word("outside", 10.0, 10.5),
+        ];
+
+        let srt = generate_srt(&words, 0.0, 4.0);
+        assert!(srt.starts_with("1\n00:00:00,000 --> 00:00:02,500\nalpha beta gamma\n\n"));
+        assert!(
+            srt.contains("2\n00:00:03,000 --> 00:00:03,500\ndelta\n\n"),
+            "unexpected srt: {srt:?}"
+        );
+        assert!(!srt.contains("outside"));
+    }
+
+    #[test]
+    fn generate_srt_is_empty_without_words_in_window() {
+        let words = vec![word("alpha", 10.0, 11.0)];
+        assert!(generate_srt(&words, 0.0, 5.0).is_empty());
+    }
+
+    #[test]
+    fn ass_escape_text_strips_override_characters() {
+        assert_eq!(ass_escape_text("a{b}c\\d\ne\rf"), "abcdef");
+    }
+
+    #[test]
+    fn build_ass_captions_contains_header_and_uppercase_dialogue() {
+        let words = vec![word("hello", 0.0, 0.5), word("world", 0.5, 1.0)];
+        let ass = build_ass_captions(&words, 0.0, 5.0, "classic-outline");
+
+        assert!(ass.contains("[Script Info]"));
+        assert!(ass.contains("PlayResX: 1080"));
+        assert!(ass.contains("PlayResY: 1920"));
+        assert!(ass.contains("Dialogue: 0,0:00:00.00,0:00:01.00,Default,,0,0,0,,HELLO WORLD"));
+    }
+
+    #[test]
+    fn build_ass_captions_skips_degenerate_timings() {
+        let words = vec![word("zero", 1.0, 1.0)];
+        let ass = build_ass_captions(&words, 0.0, 5.0, "modern-box");
+        assert!(!ass.contains("Dialogue:"));
+    }
+
+    #[test]
+    fn ass_caption_style_falls_back_to_modern_box() {
+        let style = ass_caption_style("does-not-exist");
+        assert_eq!(style.primary_colour, "&H00FFFFFF");
+        assert_eq!(style.border_style, 3);
+    }
+
+    #[test]
+    fn project_output_slug_sanitizes_file_stem() {
+        assert_eq!(
+            project_output_slug(&project("/tmp/My Video - Final!.mp4")),
+            "My-Video---Final"
+        );
+        assert_eq!(project_output_slug(&project("/tmp/episode_01.mkv")), "episode_01");
+    }
+
+    #[test]
+    fn project_output_slug_falls_back_to_project_id() {
+        assert_eq!(project_output_slug(&project("/")), "project-id");
+    }
+
+    #[test]
+    fn validate_media_extension_accepts_supported_types_case_insensitively() {
+        for path in ["clip.mp4", "clip.MOV", "audio.mp3", "audio.wav", "audio.m4a"] {
+            assert!(validate_media_extension(path).is_ok(), "{path} should be accepted");
+        }
+    }
+
+    #[test]
+    fn validate_media_extension_rejects_unknown_and_missing_extensions() {
+        let unsupported = validate_media_extension("clip.avi").unwrap_err().to_string();
+        assert!(unsupported.contains("Unsupported file type .avi"));
+
+        let missing = validate_media_extension("clip").unwrap_err().to_string();
+        assert!(missing.contains("does not have an extension"));
+    }
+
+    #[test]
+    fn demo_transcript_has_words_and_segments() {
+        let transcript = demo_transcript();
+        assert!(!transcript.words.is_empty());
+        assert!(!transcript.segments.is_empty());
+        assert!(transcript.duration > 0.0);
+        assert_eq!(transcript.speakers, vec!["A".to_string()]);
     }
 }
