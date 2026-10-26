@@ -97,6 +97,14 @@ When you first launch the application, you will be greeted by an **Onboarding Wi
    * **Claude**: For premium copywriting, hooks, and moment detection.
 2. Click **Save & Start** to immediately load the dashboard.
 
+#### Option C: Any OpenAI-Compatible Endpoint
+Select **OpenAI-Compatible (Custom Base URL)** in **API Settings** and provide:
+* **Base URL**: the API root, e.g. `http://localhost:1234/v1` (LM Studio), `http://localhost:8000/v1` (vLLM), `http://localhost:8080/v1` (llama.cpp), or a hosted provider URL.
+* **Model Name**: the model identifier that endpoint expects.
+* **API Key**: optional; leave empty for local servers that do not require auth.
+
+The app calls `POST {Base URL}/chat/completions` and retries without `response_format` if the server rejects JSON mode.
+
 ---
 
 ### ⚙️ Modifying Settings & Resetting Onboarding
@@ -125,8 +133,14 @@ DEEPGRAM_API_KEY=your-deepgram-api-key
 DEEPSEEK_API_KEY=your-deepseek-api-key
 ANTHROPIC_API_KEY=your-anthropic-api-key
 
-# Choose your default AI analysis provider ("deepseek" or "claude")
+# Choose your default AI analysis provider
+# ("deepseek", "claude", "gemini", "openai", "openrouter", "groq", "local" or "openai-compatible")
 LLM_PROVIDER=deepseek
+
+# Only for LLM_PROVIDER=openai-compatible
+OPENAI_BASE_URL=http://localhost:1234/v1
+OPENAI_COMPATIBLE_MODEL=qwen2.5-7b-instruct
+OPENAI_COMPATIBLE_API_KEY=
 ```
 
 ### 2. Run in Development Mode
@@ -142,6 +156,33 @@ To build and package the native macOS app bundle (`.app` and `.dmg` installer):
 npm run tauri:build
 ```
 The output installers will be built under `src-tauri/target/release/bundle/`.
+
+### 4. Multi-Platform Build (Windows + Linux + Android + iOS)
+One command attempts every platform the current host can actually target:
+```bash
+npm run build:all
+```
+Each platform is detected first; unsupported ones are skipped with the reason instead of aborting the run. Successful bundles are copied to `artifacts/<platform>/`.
+
+```bash
+npm run build:linux     # .deb / .rpm / .AppImage
+npm run build:windows   # .msi / NSIS .exe
+npm run build:android   # .apk / .aab
+npm run build:ios       # .app / .ipa (macOS only)
+
+npm run build:all -- --only=linux,android   # subset
+npm run build:all -- --skip=windows         # exclude one
+npm run build:all -- --dry-run              # print commands only
+```
+
+Host capability matrix:
+
+| Target | Requires |
+| --- | --- |
+| Linux | Linux host + `webkit2gtk-4.1`, `gtk+-3.0`, `libsoup-3.0` (pkg-config) |
+| Windows | Windows host, **or** WSL with Windows `cargo.exe` + `node.exe` + MSVC Build Tools. From WSL the source is mirrored to `%USERPROFILE%\autoshorts-build` and built by the Windows toolchain. |
+| Android | `ANDROID_HOME` (or `~/Android/Sdk`) with NDK, JDK 17, Android Rust targets (added automatically). `tauri android init` runs on first build. |
+| iOS | macOS + Xcode only. Cannot be produced from Linux/WSL — use a Mac or the `Release App` GitHub workflow. |
 
 <a id="support"></a>
 

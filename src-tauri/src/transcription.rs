@@ -1,9 +1,243 @@
 use std::collections::BTreeSet;
+use std::io::{BufRead, BufReader, Read};
+use std::path::PathBuf;
+use std::process::Stdio;
 
 use anyhow::{anyhow, Context, Result};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tauri::Emitter;
 
 use crate::models::{NormalizedTranscript, TranscriptSegment, TranscriptWord};
+
+/// Whisper checkpoints supported by the download UI: (id, label, approx size in MB).
+pub const WHISPER_MODELS: &[(&str, &str, u64)] = &[
+    ("tiny", "Tiny", 75),
+    ("base", "Base", 142),
+    ("small", "Small", 466),
+    ("medium", "Medium", 1500),
+    ("large-v3", "Large v3", 3090),
+];
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WhisperModelInfo {
+    pub id: String,
+    pub label: String,
+    pub size_mb: u64,
+    pub downloaded: bool,
+    pub path: Option<String>,
+}
+
+/// Directories where the Python `openai-whisper` package stores its checkpoints.
+pub fn whisper_cache_dirs() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+
+    if let Some(home) = dirs::home_dir() {
+        dirs.push(home.join(".cache").join("whisper"));
+    }
+    if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
+        if !xdg.trim().is_empty() {
+            dirs.push(PathBuf::from(xdg).join("whisper"));
+        }
+    }
+    if let Some(cache) = dirs::cache_dir() {
+        dirs.push(cache.join("whisper"));
+    }
+
+    dirs.dedup();
+    dirs
+}
+
+pub fn whisper_model_path(model: &str) -> PathBuf {
+    let file = format!("{model}.pt");
+    for dir in whisper_cache_dirs() {
+        let candidate = dir.join(&file);
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    whisper_cache_dirs()
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| PathBuf::from(".").join("whisper"))
+        .join(file)
+}
+
+pub fn whisper_model_downloaded(model: &str) -> bool {
+    let path = whisper_model_path(model);
+    std::fs::metadata(&path)
+        .map(|meta| meta.is_file() && meta.len() > 0)
+        .unwrap_or(false)
+}
+
+pub fn list_whisper_models() -> Vec<WhisperModelInfo> {
+    WHISPER_MODELS
+        .iter()
+        .map(|(id, label, size_mb)| {
+            let downloaded = whisper_model_downloaded(id);
+            WhisperModelInfo {
+                id: (*id).to_string(),
+                label: (*label).to_string(),
+                size_mb: *size_mb,
+                downloaded,
+                path: downloaded.then(|| whisper_model_path(id).to_string_lossy().to_string()),
+            }
+        })
+        .collect()
+}
+
+fn parse_percentage(line: &str) -> Option<f64> {
+    let percent_index = line.find('%')?;
+    let digits: String = line[..percent_index]
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect::<Vec<char>>()
+        .into_iter()
+        .rev()
+        .collect();
+    digits.parse::<f64>().ok()
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WhisperDownloadPayload {
+    status: String,
+    percentage: Option<f64>,
+}
+
+/// Downloads a Whisper checkpoint by letting the Python package fetch it into its cache,
+/// streaming progress back to the UI through the `whisper-model-progress` event.
+pub async fn download_whisper_model(app: tauri::AppHandle, model: String) -> Result<()> {
+    let model = model.trim().to_string();
+    if model.is_empty() {
+        return Err(anyhow!("No Whisper model was selected"));
+    }
+
+    if whisper_model_downloaded(&model) {
+        let _ = app.emit(
+            "whisper-model-progress",
+            WhisperDownloadPayload {
+                status: "Model already downloaded".to_string(),
+                percentage: Some(100.0),
+            },
+        );
+        return Ok(());
+    }
+
+    if !whisper_python_exists() {
+        return Err(anyhow!(
+            "Python package 'whisper' is not installed. Run 'pip3 install -U openai-whisper' first."
+        ));
+    }
+
+    let python = find_python_command().ok_or_else(|| anyhow!("Python interpreter not found"))?;
+    let label = WHISPER_MODELS
+        .iter()
+        .find(|(id, _, _)| *id == model)
+        .map(|(_, label, _)| (*label).to_string())
+        .unwrap_or_else(|| model.clone());
+
+    let _ = app.emit(
+        "whisper-model-progress",
+        WhisperDownloadPayload {
+            status: format!("Preparing {label} model..."),
+            percentage: Some(0.0),
+        },
+    );
+
+    let script = "import sys\nimport whisper\nwhisper.load_model(sys.argv[1])\nprint('AUTOSHORTS_MODEL_READY')\n";
+
+    let app_handle = app.clone();
+    let model_for_task = model.clone();
+    let label_for_task = label.clone();
+
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut child = std::process::Command::new(&python)
+            .args(["-c", script, &model_for_task])
+            .env("PYTHONUNBUFFERED", "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("starting python whisper download")?;
+
+        let mut stderr = child.stderr.take().context("capturing whisper stderr")?;
+        let mut buffer: Vec<u8> = Vec::new();
+        let mut byte = [0u8; 1];
+        let mut last_percentage = 0.0_f64;
+        let mut tail: Vec<String> = Vec::new();
+
+        loop {
+            match stderr.read(&mut byte) {
+                Ok(0) => break,
+                Ok(_) => {
+                    if byte[0] == b'\r' || byte[0] == b'\n' {
+                        if !buffer.is_empty() {
+                            let line = String::from_utf8_lossy(&buffer).trim().to_string();
+                            buffer.clear();
+                            if line.is_empty() {
+                                continue;
+                            }
+                            if let Some(percentage) = parse_percentage(&line) {
+                                if percentage > last_percentage {
+                                    last_percentage = percentage;
+                                    let _ = app_handle.emit(
+                                        "whisper-model-progress",
+                                        WhisperDownloadPayload {
+                                            status: format!(
+                                                "Downloading {label_for_task} model: {percentage:.0}%"
+                                            ),
+                                            percentage: Some(percentage),
+                                        },
+                                    );
+                                }
+                            } else {
+                                tail.push(line);
+                                if tail.len() > 20 {
+                                    tail.remove(0);
+                                }
+                            }
+                        }
+                    } else {
+                        buffer.push(byte[0]);
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+
+        let status = child.wait().context("waiting for whisper download")?;
+        if !status.success() {
+            return Err(anyhow!(
+                "Whisper download failed: {}",
+                tail.join(" | ")
+            ));
+        }
+
+        if !whisper_model_downloaded(&model_for_task) {
+            return Err(anyhow!(
+                "Whisper finished but the checkpoint for '{}' was not found in {}",
+                model_for_task,
+                whisper_model_path(&model_for_task).to_string_lossy()
+            ));
+        }
+
+        Ok(())
+    })
+    .await
+    .context("spawn_blocking failed")??;
+
+    let _ = app.emit(
+        "whisper-model-progress",
+        WhisperDownloadPayload {
+            status: format!("{label} model ready"),
+            percentage: Some(100.0),
+        },
+    );
+
+    Ok(())
+}
 
 pub async fn transcribe_deepgram(audio_path: &str, api_key: &str) -> Result<NormalizedTranscript> {
     let bytes = tokio::fs::read(audio_path)
@@ -247,9 +481,98 @@ fn normalize_whisper_raw_json(raw: serde_json::Value) -> Result<NormalizedTransc
     })
 }
 
-pub async fn transcribe_local(audio_path: &str, model_path: &str) -> Result<NormalizedTranscript> {
+/// Callback used to report transcription progress as a 0..=100 percentage.
+pub type ProgressCallback = Box<dyn FnMut(f64) + Send>;
+
+/// Parse `HH:MM:SS.mmm` (or `MM:SS.mmm`) into seconds.
+fn parse_timestamp_token(token: &str) -> Option<f64> {
+    let parts: Vec<&str> = token.trim().split(':').collect();
+    match parts.as_slice() {
+        [hours, minutes, seconds] => Some(
+            hours.parse::<f64>().ok()? * 3600.0
+                + minutes.parse::<f64>().ok()? * 60.0
+                + seconds.parse::<f64>().ok()?,
+        ),
+        [minutes, seconds] => Some(
+            minutes.parse::<f64>().ok()? * 60.0 + seconds.parse::<f64>().ok()?,
+        ),
+        [seconds] => seconds.parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+/// Whisper prints `[00:00:00.000 --> 00:00:05.000] text` for every decoded
+/// segment, which gives us a real progress signal without extra tooling.
+fn parse_segment_end_sec(line: &str) -> Option<f64> {
+    let arrow = line.find("--> ")?;
+    let rest = line[arrow + 4..].trim_start();
+    let end = rest.split(']').next()?.trim();
+    parse_timestamp_token(end)
+}
+
+/// Run a whisper process while streaming its stdout, mapping decoded segment
+/// timestamps onto a 0..=100 progress value.
+fn run_streaming(
+    mut cmd: std::process::Command,
+    total_duration: Option<f64>,
+    on_progress: &mut Option<ProgressCallback>,
+) -> Result<(std::process::ExitStatus, String, String)> {
+    let mut child = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("starting whisper process")?;
+
+    let stderr_handle = {
+        let mut stderr = child.stderr.take().context("capturing whisper stderr")?;
+        std::thread::spawn(move || {
+            let mut buffer = String::new();
+            let _ = stderr.read_to_string(&mut buffer);
+            buffer
+        })
+    };
+
+    let mut stdout_buffer = String::new();
+    if let Some(stdout) = child.stdout.take() {
+        let mut last_percentage = 0.0_f64;
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            stdout_buffer.push_str(&line);
+            stdout_buffer.push('\n');
+
+            if let (Some(total), Some(callback)) = (total_duration, on_progress.as_mut()) {
+                if total > 0.0 {
+                    if let Some(end) = parse_segment_end_sec(&line) {
+                        let percentage = (end / total * 100.0).clamp(0.0, 99.0);
+                        if percentage > last_percentage + 0.5 {
+                            last_percentage = percentage;
+                            callback(percentage);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let status = child.wait().context("waiting for whisper process")?;
+    let stderr_buffer = stderr_handle.join().unwrap_or_default();
+    Ok((status, stdout_buffer, stderr_buffer))
+}
+
+pub async fn transcribe_local(
+    audio_path: &str,
+    model_dir: &str,
+    model_size: &str,
+    total_duration: Option<f64>,
+    on_progress: Option<ProgressCallback>,
+) -> Result<NormalizedTranscript> {
     let audio_path = audio_path.to_string();
-    let model_path = model_path.to_string();
+    let model_dir = model_dir.to_string();
+    let model_size = if model_size.trim().is_empty() {
+        "base".to_string()
+    } else {
+        model_size.trim().to_string()
+    };
 
     if whisper_cli_exists() {
         let audio_path_buf = std::path::Path::new(&audio_path);
@@ -261,20 +584,50 @@ pub async fn transcribe_local(audio_path: &str, model_path: &str) -> Result<Norm
         let audio_dir_str = audio_dir.to_string_lossy().to_string();
         let audio_dir_clone = audio_dir.to_path_buf();
         let audio_stem_clone = audio_stem.to_string();
+        let cli_model = model_size.clone();
 
         tokio::task::spawn_blocking(move || {
-            let output = std::process::Command::new("whisper")
-                .arg(&audio_path)
-                .args(["--model", "base"])
-                .args(["--output_format", "json"])
-                .args(["--output_dir", &audio_dir_str])
-                .args(["--word_timestamps", "True"])
-                .output()
-                .context("executing whisper CLI")?;
+            let mut on_progress = on_progress;
+            // Only pass a GPU device when PyTorch actually reports one; the CLI
+            // fails hard on `--device cuda` when CUDA is unavailable.
+            let device = crate::hardware::whisper_device();
 
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-                let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let build = |device: Option<&str>| {
+                let mut cmd = std::process::Command::new("whisper");
+                cmd.arg(&audio_path)
+                    .args(["--model", &cli_model])
+                    .args(["--output_format", "json"])
+                    .args(["--output_dir", &audio_dir_str])
+                    .args(["--word_timestamps", "True"])
+                    .args(["--verbose", "True"]);
+                if let Some(device) = device {
+                    cmd.args(["--device", device]);
+                }
+                // Keep stdout unbuffered so segment timestamps arrive as they are decoded.
+                cmd.env("PYTHONUNBUFFERED", "1");
+                cmd
+            };
+
+            let (mut status, mut stdout, mut stderr) = run_streaming(
+                build((device != "cpu").then_some(device)),
+                total_duration,
+                &mut on_progress,
+            )?;
+
+            if !status.success() && device != "cpu" {
+                // The `whisper` executable may run under a different interpreter
+                // than the one we probed, so let it pick its own device.
+                eprintln!(
+                    "[autoshorts] whisper --device {device} failed; retrying with the default device"
+                );
+                let (retry_status, retry_stdout, retry_stderr) =
+                    run_streaming(build(None), total_duration, &mut on_progress)?;
+                status = retry_status;
+                stdout = retry_stdout;
+                stderr = retry_stderr;
+            }
+
+            if !status.success() {
                 return Err(anyhow!("Whisper CLI failed:\nStderr: {}\nStdout: {}", stderr, stdout));
             }
 
@@ -298,30 +651,46 @@ pub async fn transcribe_local(audio_path: &str, model_path: &str) -> Result<Norm
         .context("spawn_blocking failed")?
     } else {
         // Resolve the directory where the model lives. We'll put transcribe.py there.
-        let model_dir = std::path::Path::new(&model_path)
-            .parent()
-            .ok_or_else(|| anyhow!("Invalid model path"))?;
-        
+        let model_dir = std::path::Path::new(&model_dir);
+
         let script_path = model_dir.join("transcribe.py");
-        if !script_path.exists() {
+        // Always rewrite the helper script so existing installations pick up
+        // the streaming segment output used for progress reporting.
+        {
             let script_content = r#"import sys
 import json
 import whisper
 
+def load_model(model_name, device):
+    """Load on the GPU when asked to, falling back to CPU on any failure."""
+    if device:
+        try:
+            return whisper.load_model(model_name, device=device)
+        except Exception as exc:
+            print(
+                f"[autoshorts] device '{device}' unavailable ({exc}); using CPU",
+                file=sys.stderr,
+            )
+    return whisper.load_model(model_name)
+
 def main():
     if len(sys.argv) < 3:
-        print("Usage: transcribe.py <audio_path> <output_json_path> [model_name]")
+        print("Usage: transcribe.py <audio_path> <output_json_path> [model_name] [device]")
         sys.exit(1)
         
     audio_path = sys.argv[1]
     output_json_path = sys.argv[2]
     model_name = sys.argv[3] if len(sys.argv) > 3 else "base"
+    device = sys.argv[4] if len(sys.argv) > 4 else ""
     
-    # Load model. Automatically uses MPS on Apple Silicon if PyTorch supports it.
-    model = whisper.load_model(model_name)
+    # Load model. Uses the requested GPU device when one was detected
+    # (CUDA / Apple MPS), otherwise the default CPU path.
+    model = load_model(model_name, device)
     
-    # Transcribe with word-level timestamps
-    result = model.transcribe(audio_path, word_timestamps=True)
+    # Transcribe with word-level timestamps. verbose=True streams each decoded
+    # segment ("[start --> end] text") to stdout, which the Rust side parses
+    # into progress updates.
+    result = model.transcribe(audio_path, word_timestamps=True, verbose=True)
     
     normalized = {
         "language": result.get("language", "en"),
@@ -361,19 +730,33 @@ if __name__ == "__main__":
         let script_path_str = script_path.to_string_lossy().to_string();
         let output_json_path_str = output_json_path.to_string_lossy().to_string();
 
+        // Prefer the checkpoint already downloaded by the app so transcription stays offline.
+        let python_model = if whisper_model_downloaded(&model_size) {
+            whisper_model_path(&model_size)
+                .to_string_lossy()
+                .to_string()
+        } else {
+            model_size.clone()
+        };
+
         tokio::task::spawn_blocking(move || {
+            let mut on_progress = on_progress;
             let python_bin = find_python_command().unwrap_or_else(|| "python".to_string());
-            let output = std::process::Command::new(&python_bin)
-                .arg(&script_path_str)
+            // Probed once per process inside this blocking task: importing
+            // torch takes a moment, so it must not run on the async runtime.
+            let device = crate::hardware::whisper_device_for(Some(&python_bin));
+            let mut cmd = std::process::Command::new(&python_bin);
+            cmd.arg(&script_path_str)
                 .arg(&audio_path)
                 .arg(&output_json_path_str)
-                .arg("base") // default model size
-                .output()
-                .context("executing python transcribe.py")?;
+                .arg(&python_model)
+                .arg(device);
+            // Keep stdout unbuffered so whisper's segment prints stream live.
+            cmd.env("PYTHONUNBUFFERED", "1");
 
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-                let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let (status, stdout, stderr) = run_streaming(cmd, total_duration, &mut on_progress)?;
+
+            if !status.success() {
                 return Err(anyhow!("Python transcription script failed:\nStderr: {}\nStdout: {}", stderr, stdout));
             }
 

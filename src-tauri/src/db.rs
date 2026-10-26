@@ -99,6 +99,10 @@ impl Database {
         )?;
         let _ = conn.execute("ALTER TABLE projects ADD COLUMN name TEXT", []);
         let _ = conn.execute("ALTER TABLE projects ADD COLUMN caption_style TEXT", []);
+        // No ffmpeg process survives an app restart, so any clip still marked
+        // `cutting` was interrupted. Reset it instead of showing a render that
+        // can never finish.
+        let _ = conn.execute("UPDATE clips SET status = 'pending' WHERE status = 'cutting'", []);
         Ok(())
     }
 

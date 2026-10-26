@@ -13,10 +13,16 @@ pub struct EnvironmentStatus {
     pub has_openai_key: bool,
     pub has_openrouter_key: bool,
     pub has_groq_key: bool,
+    pub has_openai_compatible_key: bool,
+    pub openai_base_url: Option<String>,
     pub llm_provider: String,
     pub has_local_whisper_model: bool,
     pub has_ollama: bool,
     pub has_ytdlp: bool,
+    /// True when a hardware video encoder was detected and probed successfully.
+    pub gpu_accel: bool,
+    /// Human-readable name of the encoder actually used for clip rendering.
+    pub video_encoder: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

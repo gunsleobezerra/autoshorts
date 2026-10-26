@@ -4,6 +4,36 @@ use serde_json::json;
 
 use crate::models::{CandidateDraft, NormalizedTranscript, TranscriptSegment};
 
+const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+
+fn candidate_prompt(segments: &str) -> String {
+    format!(
+        "You are an elite, world-class social media strategist with a track record of generating viral multi-million-view Shorts, TikToks, and Reels. \
+Your sole objective is to identify the ABSOLUTE BEST, most highly-engaging, and trend-setting short-form clip candidates from the provided transcript. \
+Do NOT pick random or mediocre segments. Be ruthless in your selection, but extract AS MANY highly viral moments as possible. \
+Every candidate must have an insanely strong, curiosity-inducing hook in the first 3 seconds to stop the scroll. \
+Clips should be 30-90 seconds long, completely self-contained, cut at clean boundaries, and deliver a massive payoff (a mind-blowing fact, hilarious joke, highly controversial opinion, or deep emotional insight). \
+Return up to 25 candidates as JSON matching exactly this schema: \
+{{\"candidates\":[{{\"start\":0.0,\"end\":0.0,\"score\":0.0,\"hook\":\"...\",\"rationale\":\"...\"}}]}}
+
+Transcript:
+{segments}"
+    )
+}
+
+/// Accepts `http://host:port`, `http://host:port/v1`, or a full `.../chat/completions` URL.
+pub fn normalize_chat_completions_url(base_url: &str) -> String {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return format!("{DEFAULT_OPENAI_BASE_URL}/chat/completions");
+    }
+    if trimmed.ends_with("/chat/completions") {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/chat/completions")
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct AnthropicMessage {
     content: Vec<AnthropicContent>,
@@ -186,17 +216,268 @@ Transcript:
 
 #[derive(Debug, Deserialize)]
 struct ChatCompletionResponse {
+    #[serde(default)]
     choices: Vec<ChatCompletionChoice>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ChatCompletionChoice {
-    message: ChatCompletionMessage,
+    #[serde(default)]
+    message: Option<ChatCompletionMessage>,
+    #[serde(default)]
+    text: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ChatCompletionMessage {
-    content: String,
+    #[serde(default)]
+    content: Option<serde_json::Value>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
+}
+
+fn extract_completion_text(res_body: &ChatCompletionResponse) -> Option<String> {
+    let choice = res_body.choices.first()?;
+    if let Some(msg) = &choice.message {
+        if let Some(val) = &msg.content {
+            let extracted = match val {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Array(parts) => parts
+                    .iter()
+                    .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                    .collect::<Vec<_>>()
+                    .join(""),
+                serde_json::Value::Null => String::new(),
+                other => other.to_string(),
+            };
+            if !extracted.trim().is_empty() {
+                return Some(extracted);
+            }
+        }
+        if let Some(reasoning) = msg.reasoning_content.as_ref().filter(|r| !r.trim().is_empty()) {
+            return Some(reasoning.clone());
+        }
+    }
+    choice.text.clone().filter(|t| !t.trim().is_empty())
+}
+
+fn body_snippet(body: &str) -> String {
+    const MAX_CHARS: usize = 800;
+    let trimmed = body.trim();
+    let snippet: String = trimmed.chars().take(MAX_CHARS).collect();
+    if trimmed.chars().count() > MAX_CHARS {
+        format!("{snippet}…")
+    } else {
+        snippet
+    }
+}
+
+/// Parses Server-Sent Events chunk payloads (object: `chat.completion.chunk`)
+/// and concatenates the streamed deltas. Used as fallback for servers that
+/// stream even when `stream: false` is requested.
+fn parse_sse_stream_text(body: &str) -> Option<String> {
+    let mut collected = String::new();
+    for line in body.lines() {
+        let line = line.trim();
+        if !line.starts_with("data:") {
+            continue;
+        }
+        let payload = line["data:".len()..].trim();
+        if payload.is_empty() || payload == "[DONE]" {
+            continue;
+        }
+        let chunk: serde_json::Value = serde_json::from_str(payload).ok()?;
+        if chunk.get("object").and_then(|o| o.as_str()) != Some("chat.completion.chunk") {
+            return None;
+        }
+        if let Some(delta) = chunk
+            .pointer("/choices/0/delta/content")
+            .and_then(|c| c.as_str())
+        {
+            collected.push_str(delta);
+        }
+        if let Some(text) = chunk.pointer("/choices/0/text").and_then(|t| t.as_str()) {
+            collected.push_str(text);
+        }
+    }
+    if collected.trim().is_empty() {
+        None
+    } else {
+        Some(collected)
+    }
+}
+
+/// Reads the raw body first so parse failures can report what the server actually sent
+/// (error object, `content: null`, streamed chunks, HTML from a wrong base URL, ...).
+async fn read_chat_completion_text(
+    response: reqwest::Response,
+    provider_label: &str,
+) -> Result<String> {
+    let body = response
+        .text()
+        .await
+        .with_context(|| format!("reading {provider_label} response body"))?;
+    let res_body: ChatCompletionResponse = serde_json::from_str(&body).with_context(|| {
+        format!(
+            "parsing {provider_label} response: {}",
+            body_snippet(&body)
+        )
+    })?;
+    if let Some(text) = extract_completion_text(&res_body) {
+        return Ok(text);
+    }
+    if let Some(text) = parse_sse_stream_text(&body) {
+        return Ok(text);
+    }
+    Err(anyhow!(
+        "{provider_label} response did not include choices content: {}",
+        body_snippet(&body)
+    ))
+}
+
+fn chat_completion_payload(model: &str, prompt: &str, json_mode: bool) -> serde_json::Value {
+    let mut payload = json!({
+        "model": model,
+        "messages": [
+            {
+                "role": "user",
+                "content": prompt,
+            }
+        ],
+        "temperature": 0.2,
+        // Some [OI]-compatible servers (LM Studio, vLLM) default to streaming; force a full response.
+        "stream": false,
+    });
+    if json_mode {
+        payload["response_format"] = json!({ "type": "json_object" });
+    }
+    payload
+}
+
+async fn send_chat_completion(
+    client: &reqwest::Client,
+    url: &str,
+    api_key: Option<&str>,
+    model: &str,
+    prompt: &str,
+    json_mode: bool,
+    provider_label: &str,
+) -> Result<reqwest::Response> {
+    let mut request = client
+        .post(url)
+        .json(&chat_completion_payload(model, prompt, json_mode));
+    if let Some(key) = api_key.map(str::trim).filter(|key| !key.is_empty()) {
+        request = request.header("Authorization", format!("Bearer {key}"));
+    }
+    request
+        .send()
+        .await
+        .with_context(|| format!("calling {provider_label}"))
+}
+
+/// Calls any server exposing the OpenAI `POST /chat/completions` contract.
+async fn detect_candidates_openai_style(
+    transcript: &NormalizedTranscript,
+    api_key: Option<&str>,
+    model: &str,
+    base_url: &str,
+    provider_label: &str,
+) -> Result<Vec<CandidateDraft>> {
+    let segments = compact_segments(&transcript.segments);
+    let prompt = candidate_prompt(&segments);
+    let url = normalize_chat_completions_url(base_url);
+    let client = reqwest::Client::new();
+
+    let mut response = send_chat_completion(
+        &client,
+        &url,
+        api_key,
+        model,
+        &prompt,
+        true,
+        provider_label,
+    )
+    .await?;
+
+    // Some OpenAI-compatible servers (LM Studio, llama.cpp, vLLM) reject `response_format`.
+    if matches!(response.status().as_u16(), 400 | 422) {
+        response = send_chat_completion(
+            &client,
+            &url,
+            api_key,
+            model,
+            &prompt,
+            false,
+            provider_label,
+        )
+        .await?;
+    }
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(anyhow!("{provider_label} request failed ({status}): {body}"));
+    }
+
+    let text = read_chat_completion_text(response, provider_label).await?;
+
+    let min_duration = if transcript.duration < 60.0 {
+        (transcript.duration * 0.5).max(5.0)
+    } else {
+        30.0
+    };
+    parse_candidate_json(&text, min_duration)
+}
+
+pub async fn detect_candidates_with_openai_compatible(
+    transcript: &NormalizedTranscript,
+    api_key: Option<&str>,
+    model_name: Option<&str>,
+    base_url: Option<&str>,
+) -> Result<Vec<CandidateDraft>> {
+    let base = base_url
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            std::env::var("OPENAI_BASE_URL")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+        .ok_or_else(|| {
+            anyhow!(
+                "Set OPENAI_BASE_URL or provide a Base URL for the OpenAI-compatible endpoint."
+            )
+        })?;
+
+    let model = model_name
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            std::env::var("OPENAI_COMPATIBLE_MODEL")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+        .or_else(|| {
+            std::env::var("OPENAI_MODEL")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+        .ok_or_else(|| {
+            anyhow!(
+                "Set OPENAI_COMPATIBLE_MODEL or provide a model name for the OpenAI-compatible endpoint."
+            )
+        })?;
+
+    detect_candidates_openai_style(
+        transcript,
+        api_key,
+        &model,
+        &base,
+        "OpenAI-compatible endpoint",
+    )
+    .await
 }
 
 pub async fn detect_candidates_with_openai(
@@ -218,9 +499,12 @@ Transcript:
     );
 
     let model = std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
+    let base_url =
+        std::env::var("OPENAI_BASE_URL").unwrap_or_else(|_| DEFAULT_OPENAI_BASE_URL.to_string());
+    let url = normalize_chat_completions_url(&base_url);
 
     let response = reqwest::Client::new()
-        .post("https://api.openai.com/v1/chat/completions")
+        .post(&url)
         .header("Authorization", format!("Bearer {api_key}"))
         .json(&json!({
             "model": model,
@@ -245,13 +529,7 @@ Transcript:
         return Err(anyhow!("OpenAI request failed ({status}): {body}"));
     }
 
-    let res_body: ChatCompletionResponse =
-        response.json().await.context("parsing OpenAI response")?;
-    let text = res_body
-        .choices
-        .first()
-        .map(|c| c.message.content.clone())
-        .ok_or_else(|| anyhow!("OpenAI response did not include choices content"))?;
+    let text = read_chat_completion_text(response, "[OI]").await?;
 
     let min_duration = if transcript.duration < 60.0 {
         (transcript.duration * 0.5).max(5.0)
@@ -313,15 +591,7 @@ Transcript:
         return Err(anyhow!("OpenRouter request failed ({status}): {body}"));
     }
 
-    let res_body: ChatCompletionResponse = response
-        .json()
-        .await
-        .context("parsing OpenRouter response")?;
-    let text = res_body
-        .choices
-        .first()
-        .map(|c| c.message.content.clone())
-        .ok_or_else(|| anyhow!("OpenRouter response did not include choices content"))?;
+    let text = read_chat_completion_text(response, "OpenRouter").await?;
 
     let min_duration = if transcript.duration < 60.0 {
         (transcript.duration * 0.5).max(5.0)
@@ -378,15 +648,7 @@ Transcript:
         return Err(anyhow!("Groq request failed ({status}): {body}"));
     }
 
-    let res_body: ChatCompletionResponse = response
-        .json()
-        .await
-        .context("parsing Groq response")?;
-    let text = res_body
-        .choices
-        .first()
-        .map(|c| c.message.content.clone())
-        .ok_or_else(|| anyhow!("Groq response did not include choices content"))?;
+    let text = read_chat_completion_text(response, "Groq").await?;
 
     let min_duration = if transcript.duration < 60.0 {
         (transcript.duration * 0.5).max(5.0)
