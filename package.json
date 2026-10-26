@@ -14,8 +14,8 @@
     "build:windows": "node scripts/build-all.mjs --only=windows",
     "build:android": "node scripts/build-all.mjs --only=android",
     "build:ios": "node scripts/build-all.mjs --only=ios",
-    "test": "vitest run",
-    "test:watch": "vitest",
+    "test": "node scripts/test.mjs",
+    "test:watch": "node scripts/test.mjs watch",
     "test:rust": "cargo test --manifest-path src-tauri/Cargo.toml"
   },
   "dependencies": {
