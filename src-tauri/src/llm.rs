@@ -4,6 +4,36 @@ use serde_json::json;
 
 use crate::models::{CandidateDraft, NormalizedTranscript, TranscriptSegment};
 
+const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+
+fn candidate_prompt(segments: &str) -> String {
+    format!(
+        "You are an elite, world-class social media strategist with a track record of generating viral multi-million-view Shorts, TikToks, and Reels. \
+Your sole objective is to identify the ABSOLUTE BEST, most highly-engaging, and trend-setting short-form clip candidates from the provided transcript. \
+Do NOT pick random or mediocre segments. Be ruthless in your selection, but extract AS MANY highly viral moments as possible. \
+Every candidate must have an insanely strong, curiosity-inducing hook in the first 3 seconds to stop the scroll. \
+Clips should be 30-90 seconds long, completely self-contained, cut at clean boundaries, and deliver a massive payoff (a mind-blowing fact, hilarious joke, highly controversial opinion, or deep emotional insight). \
+Return up to 25 candidates as JSON matching exactly this schema: \
+{{\"candidates\":[{{\"start\":0.0,\"end\":0.0,\"score\":0.0,\"hook\":\"...\",\"rationale\":\"...\"}}]}}
+
+Transcript:
+{segments}"
+    )
+}
+
+/// Accepts `http://host:port`, `http://host:port/v1`, or a full `.../chat/completions` URL.
+pub fn normalize_chat_completions_url(base_url: &str) -> String {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return format!("{DEFAULT_OPENAI_BASE_URL}/chat/completions");
+    }
+    if trimmed.ends_with("/chat/completions") {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/chat/completions")
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct AnthropicMessage {
     content: Vec<AnthropicContent>,
@@ -186,17 +216,268 @@ Transcript:
 
 #[derive(Debug, Deserialize)]
 struct ChatCompletionResponse {
+    #[serde(default)]
     choices: Vec<ChatCompletionChoice>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ChatCompletionChoice {
-    message: ChatCompletionMessage,
+    #[serde(default)]
+    message: Option<ChatCompletionMessage>,
+    #[serde(default)]
+    text: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ChatCompletionMessage {
-    content: String,
+    #[serde(default)]
+    content: Option<serde_json::Value>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
+}
+
+fn extract_completion_text(res_body: &ChatCompletionResponse) -> Option<String> {
+    let choice = res_body.choices.first()?;
+    if let Some(msg) = &choice.message {
+        if let Some(val) = &msg.content {
+            let extracted = match val {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Array(parts) => parts
+                    .iter()
+                    .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                    .collect::<Vec<_>>()
+                    .join(""),
+                serde_json::Value::Null => String::new(),
+                other => other.to_string(),
+            };
+            if !extracted.trim().is_empty() {
+                return Some(extracted);
+            }
+        }
+        if let Some(reasoning) = msg.reasoning_content.as_ref().filter(|r| !r.trim().is_empty()) {
+            return Some(reasoning.clone());
+        }
+    }
+    choice.text.clone().filter(|t| !t.trim().is_empty())
+}
+
+fn body_snippet(body: &str) -> String {
+    const MAX_CHARS: usize = 800;
+    let trimmed = body.trim();
+    let snippet: String = trimmed.chars().take(MAX_CHARS).collect();
+    if trimmed.chars().count() > MAX_CHARS {
+        format!("{snippet}…")
+    } else {
+        snippet
+    }
+}
+
+/// Parses Server-Sent Events chunk payloads (object: `chat.completion.chunk`)
+/// and concatenates the streamed deltas. Used as fallback for servers that
+/// stream even when `stream: false` is requested.
+fn parse_sse_stream_text(body: &str) -> Option<String> {
+    let mut collected = String::new();
+    for line in body.lines() {
+        let line = line.trim();
+        if !line.starts_with("data:") {
+            continue;
+        }
+        let payload = line["data:".len()..].trim();
+        if payload.is_empty() || payload == "[DONE]" {
+            continue;
+        }
+        let chunk: serde_json::Value = serde_json::from_str(payload).ok()?;
+        if chunk.get("object").and_then(|o| o.as_str()) != Some("chat.completion.chunk") {
+            return None;
+        }
+        if let Some(delta) = chunk
+            .pointer("/choices/0/delta/content")
+            .and_then(|c| c.as_str())
+        {
+            collected.push_str(delta);
+        }
+        if let Some(text) = chunk.pointer("/choices/0/text").and_then(|t| t.as_str()) {
+            collected.push_str(text);
+        }
+    }
+    if collected.trim().is_empty() {
+        None
+    } else {
+        Some(collected)
+    }
+}
+
+/// Reads the raw body first so parse failures can report what the server actually sent
+/// (error object, `content: null`, streamed chunks, HTML from a wrong base URL, ...).
+async fn read_chat_completion_text(
+    response: reqwest::Response,
+    provider_label: &str,
+) -> Result<String> {
+    let body = response
+        .text()
+        .await
+        .with_context(|| format!("reading {provider_label} response body"))?;
+    let res_body: ChatCompletionResponse = serde_json::from_str(&body).with_context(|| {
+        format!(
+            "parsing {provider_label} response: {}",
+            body_snippet(&body)
+        )
+    })?;
+    if let Some(text) = extract_completion_text(&res_body) {
+        return Ok(text);
+    }
+    if let Some(text) = parse_sse_stream_text(&body) {
+        return Ok(text);
+    }
+    Err(anyhow!(
+        "{provider_label} response did not include choices content: {}",
+        body_snippet(&body)
+    ))
+}
+
+fn chat_completion_payload(model: &str, prompt: &str, json_mode: bool) -> serde_json::Value {
+    let mut payload = json!({
+        "model": model,
+        "messages": [
+            {
+                "role": "user",
+                "content": prompt,
+            }
+        ],
+        "temperature": 0.2,
+        // Some [OI]-compatible servers (LM Studio, vLLM) default to streaming; force a full response.
+        "stream": false,
+    });
+    if json_mode {
+        payload["response_format"] = json!({ "type": "json_object" });
+    }
+    payload
+}
+
+async fn send_chat_completion(
+    client: &reqwest::Client,
+    url: &str,
+    api_key: Option<&str>,
+    model: &str,
+    prompt: &str,
+    json_mode: bool,
+    provider_label: &str,
+) -> Result<reqwest::Response> {
+    let mut request = client
+        .post(url)
+        .json(&chat_completion_payload(model, prompt, json_mode));
+    if let Some(key) = api_key.map(str::trim).filter(|key| !key.is_empty()) {
+        request = request.header("Authorization", format!("Bearer {key}"));
+    }
+    request
+        .send()
+        .await
+        .with_context(|| format!("calling {provider_label}"))
+}
+
+/// Calls any server exposing the OpenAI `POST /chat/completions` contract.
+async fn detect_candidates_openai_style(
+    transcript: &NormalizedTranscript,
+    api_key: Option<&str>,
+    model: &str,
+    base_url: &str,
+    provider_label: &str,
+) -> Result<Vec<CandidateDraft>> {
+    let segments = compact_segments(&transcript.segments);
+    let prompt = candidate_prompt(&segments);
+    let url = normalize_chat_completions_url(base_url);
+    let client = reqwest::Client::new();
+
+    let mut response = send_chat_completion(
+        &client,
+        &url,
+        api_key,
+        model,
+        &prompt,
+        true,
+        provider_label,
+    )
+    .await?;
+
+    // Some OpenAI-compatible servers (LM Studio, llama.cpp, vLLM) reject `response_format`.
+    if matches!(response.status().as_u16(), 400 | 422) {
+        response = send_chat_completion(
+            &client,
+            &url,
+            api_key,
+            model,
+            &prompt,
+            false,
+            provider_label,
+        )
+        .await?;
+    }
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(anyhow!("{provider_label} request failed ({status}): {body}"));
+    }
+
+    let text = read_chat_completion_text(response, provider_label).await?;
+
+    let min_duration = if transcript.duration < 60.0 {
+        (transcript.duration * 0.5).max(5.0)
+    } else {
+        30.0
+    };
+    parse_candidate_json(&text, min_duration)
+}
+
+pub async fn detect_candidates_with_openai_compatible(
+    transcript: &NormalizedTranscript,
+    api_key: Option<&str>,
+    model_name: Option<&str>,
+    base_url: Option<&str>,
+) -> Result<Vec<CandidateDraft>> {
+    let base = base_url
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            std::env::var("OPENAI_BASE_URL")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+        .ok_or_else(|| {
+            anyhow!(
+                "Set OPENAI_BASE_URL or provide a Base URL for the OpenAI-compatible endpoint."
+            )
+        })?;
+
+    let model = model_name
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            std::env::var("OPENAI_COMPATIBLE_MODEL")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+        .or_else(|| {
+            std::env::var("OPENAI_MODEL")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+        .ok_or_else(|| {
+            anyhow!(
+                "Set OPENAI_COMPATIBLE_MODEL or provide a model name for the OpenAI-compatible endpoint."
+            )
+        })?;
+
+    detect_candidates_openai_style(
+        transcript,
+        api_key,
+        &model,
+        &base,
+        "OpenAI-compatible endpoint",
+    )
+    .await
 }
 
 pub async fn detect_candidates_with_openai(
@@ -218,9 +499,12 @@ Transcript:
     );
 
     let model = std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
+    let base_url =
+        std::env::var("OPENAI_BASE_URL").unwrap_or_else(|_| DEFAULT_OPENAI_BASE_URL.to_string());
+    let url = normalize_chat_completions_url(&base_url);
 
     let response = reqwest::Client::new()
-        .post("https://api.openai.com/v1/chat/completions")
+        .post(&url)
         .header("Authorization", format!("Bearer {api_key}"))
         .json(&json!({
             "model": model,
@@ -245,13 +529,7 @@ Transcript:
         return Err(anyhow!("OpenAI request failed ({status}): {body}"));
     }
 
-    let res_body: ChatCompletionResponse =
-        response.json().await.context("parsing OpenAI response")?;
-    let text = res_body
-        .choices
-        .first()
-        .map(|c| c.message.content.clone())
-        .ok_or_else(|| anyhow!("OpenAI response did not include choices content"))?;
+    let text = read_chat_completion_text(response, "[OI]").await?;
 
     let min_duration = if transcript.duration < 60.0 {
         (transcript.duration * 0.5).max(5.0)
@@ -313,15 +591,7 @@ Transcript:
         return Err(anyhow!("OpenRouter request failed ({status}): {body}"));
     }
 
-    let res_body: ChatCompletionResponse = response
-        .json()
-        .await
-        .context("parsing OpenRouter response")?;
-    let text = res_body
-        .choices
-        .first()
-        .map(|c| c.message.content.clone())
-        .ok_or_else(|| anyhow!("OpenRouter response did not include choices content"))?;
+    let text = read_chat_completion_text(response, "OpenRouter").await?;
 
     let min_duration = if transcript.duration < 60.0 {
         (transcript.duration * 0.5).max(5.0)
@@ -378,15 +648,7 @@ Transcript:
         return Err(anyhow!("Groq request failed ({status}): {body}"));
     }
 
-    let res_body: ChatCompletionResponse = response
-        .json()
-        .await
-        .context("parsing Groq response")?;
-    let text = res_body
-        .choices
-        .first()
-        .map(|c| c.message.content.clone())
-        .ok_or_else(|| anyhow!("Groq response did not include choices content"))?;
+    let text = read_chat_completion_text(response, "Groq").await?;
 
     let min_duration = if transcript.duration < 60.0 {
         (transcript.duration * 0.5).max(5.0)
@@ -719,4 +981,218 @@ fn parse_candidate_json(text: &str, min_duration: f64) -> Result<Vec<CandidateDr
     candidates.sort_by(|a, b| b.score.total_cmp(&a.score));
     candidates.truncate(10);
     Ok(candidates)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn segment(start: f64, end: f64, speaker: Option<&str>, text: &str) -> TranscriptSegment {
+        TranscriptSegment {
+            start,
+            end,
+            speaker: speaker.map(str::to_string),
+            text: text.to_string(),
+        }
+    }
+
+    #[test]
+    fn normalizes_chat_completions_urls() {
+        assert_eq!(
+            normalize_chat_completions_url(""),
+            "https://api.openai.com/v1/chat/completions"
+        );
+        assert_eq!(
+            normalize_chat_completions_url("http://localhost:1234/v1"),
+            "http://localhost:1234/v1/chat/completions"
+        );
+        assert_eq!(
+            normalize_chat_completions_url("http://localhost:1234/v1/"),
+            "http://localhost:1234/v1/chat/completions"
+        );
+        assert_eq!(
+            normalize_chat_completions_url("https://example.com/v1/chat/completions"),
+            "https://example.com/v1/chat/completions"
+        );
+        assert_eq!(
+            normalize_chat_completions_url("  http://host:8080  "),
+            "http://host:8080/chat/completions"
+        );
+    }
+
+    #[test]
+    fn compact_segments_formats_each_line() {
+        let segments = vec![
+            segment(0.0, 1.5, Some("S1"), "hello"),
+            segment(1.5, 3.0, None, "world"),
+        ];
+        assert_eq!(
+            compact_segments(&segments),
+            "[0.00-1.50] S1: hello\n[1.50-3.00] Speaker: world"
+        );
+    }
+
+    #[test]
+    fn parse_candidate_json_accepts_fenced_object_and_normalizes_scores() {
+        let text = r#"```json
+{"candidates":[
+  {"start":0,"end":40,"score":9,"hook":"A","rationale":"r"},
+  {"start":50,"end":80,"score":0.95,"hook":"B","rationale":"r"},
+  {"start":90,"end":95,"score":1,"hook":"C","rationale":"r"}
+]}
+```"#;
+
+        let drafts = parse_candidate_json(text, 30.0).unwrap();
+        assert_eq!(drafts.len(), 2);
+        assert_eq!(drafts[0].hook, "B");
+        assert_eq!(drafts[0].score, 0.95);
+        assert_eq!(drafts[1].hook, "A");
+        assert!((drafts[1].score - 0.9).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn parse_candidate_json_accepts_root_array() {
+        let text = r#"[{"start":0,"end":45,"score":0.5,"hook":"H","rationale":"R"}]"#;
+        let drafts = parse_candidate_json(text, 30.0).unwrap();
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(drafts[0].end, 45.0);
+    }
+
+    #[test]
+    fn parse_candidate_json_accepts_single_candidate_object() {
+        let text = r#"{"start":10,"end":50,"score":0.7,"hook":"H","rationale":"R"}"#;
+        let drafts = parse_candidate_json(text, 30.0).unwrap();
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(drafts[0].start, 10.0);
+    }
+
+    #[test]
+    fn parse_candidate_json_accepts_alternative_keys() {
+        let text = r#"{"moments":[{"start":0,"end":35,"score":0.4,"hook":"H","rationale":"R"}]}"#;
+        assert_eq!(parse_candidate_json(text, 30.0).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn parse_candidate_json_falls_back_to_shorter_clips() {
+        let text = r#"{"candidates":[{"start":0,"end":10,"score":0.5,"hook":"H","rationale":"R"}]}"#;
+        let drafts = parse_candidate_json(text, 30.0).unwrap();
+        assert_eq!(drafts.len(), 1);
+    }
+
+    #[test]
+    fn parse_candidate_json_drops_clips_without_hooks() {
+        let text = r#"{"candidates":[{"start":0,"end":40,"score":0.5,"hook":"  ","rationale":"R"}]}"#;
+        assert!(parse_candidate_json(text, 30.0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_candidate_json_clamps_and_parses_loose_scores() {
+        let text = r#"{"candidates":[
+            {"start":0,"end":40,"score":150,"hook":"big","rationale":""},
+            {"start":0,"end":40,"score":-2,"hook":"neg","rationale":""},
+            {"start":0,"end":40,"score":"8","hook":"str","rationale":""},
+            {"start":"0","end":"40","hook":"missing","rationale":""}
+        ]}"#;
+
+        let drafts = parse_candidate_json(text, 30.0).unwrap();
+        let by_hook = |hook: &str| drafts.iter().find(|d| d.hook == hook).cloned().unwrap();
+        assert_eq!(by_hook("big").score, 1.0);
+        assert_eq!(by_hook("neg").score, 0.0);
+        assert_eq!(by_hook("str").score, 0.8);
+        assert_eq!(by_hook("missing").score, 0.8);
+        assert_eq!(by_hook("missing").end, 40.0);
+    }
+
+    #[test]
+    fn parse_candidate_json_truncates_to_ten_candidates() {
+        let candidates: Vec<String> = (0..12)
+            .map(|i| format!(r#"{{"start":0,"end":40,"score":0.5,"hook":"h{i}","rationale":""}}"#))
+            .collect();
+        let text = format!(r#"{{"candidates":[{}]}}"#, candidates.join(","));
+        assert_eq!(parse_candidate_json(&text, 30.0).unwrap().len(), 10);
+    }
+
+    #[test]
+    fn parse_candidate_json_rejects_invalid_json() {
+        assert!(parse_candidate_json("not json at all", 30.0).is_err());
+        assert!(parse_candidate_json(r#"{"unrelated":true}"#, 30.0).is_err());
+    }
+
+    #[test]
+    fn parses_sse_streamed_chunks() {
+        let body = concat!(
+            "data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n",
+            "data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n",
+            "data: [DONE]\n"
+        );
+        assert_eq!(parse_sse_stream_text(body).as_deref(), Some("Hello"));
+    }
+
+    #[test]
+    fn rejects_non_chunk_sse_payloads_and_empty_streams() {
+        let not_chunks = "data: {\"object\":\"chat.completion\",\"choices\":[]}\n";
+        assert_eq!(parse_sse_stream_text(not_chunks), None);
+        assert_eq!(parse_sse_stream_text("event: ping\n"), None);
+    }
+
+    #[test]
+    fn extracts_text_from_chat_completion_variants() {
+        let string_content: ChatCompletionResponse = serde_json::from_value(json!({
+            "choices": [{ "message": { "content": "plain" } }]
+        }))
+        .unwrap();
+        assert_eq!(extract_completion_text(&string_content).as_deref(), Some("plain"));
+
+        let parts_content: ChatCompletionResponse = serde_json::from_value(json!({
+            "choices": [{ "message": { "content": [{ "text": "a" }, { "text": "b" }] } }]
+        }))
+        .unwrap();
+        assert_eq!(extract_completion_text(&parts_content).as_deref(), Some("ab"));
+
+        let reasoning: ChatCompletionResponse = serde_json::from_value(json!({
+            "choices": [{ "message": { "content": null, "reasoning_content": "thinking" } }]
+        }))
+        .unwrap();
+        assert_eq!(extract_completion_text(&reasoning).as_deref(), Some("thinking"));
+
+        let legacy_text: ChatCompletionResponse = serde_json::from_value(json!({
+            "choices": [{ "text": "legacy" }]
+        }))
+        .unwrap();
+        assert_eq!(extract_completion_text(&legacy_text).as_deref(), Some("legacy"));
+    }
+
+    #[test]
+    fn extract_completion_text_returns_none_without_content() {
+        let empty: ChatCompletionResponse = serde_json::from_value(json!({ "choices": [] })).unwrap();
+        assert_eq!(extract_completion_text(&empty), None);
+
+        let blank: ChatCompletionResponse = serde_json::from_value(json!({
+            "choices": [{ "message": { "content": "   " } }]
+        }))
+        .unwrap();
+        assert_eq!(extract_completion_text(&blank), None);
+    }
+
+    #[test]
+    fn body_snippet_truncates_long_bodies() {
+        let short = "  short body  ";
+        assert_eq!(body_snippet(short), "short body");
+
+        let long = "x".repeat(900);
+        let snippet = body_snippet(&long);
+        assert_eq!(snippet.chars().count(), 801);
+        assert!(snippet.ends_with('…'));
+    }
+
+    #[test]
+    fn chat_completion_payload_toggles_json_mode() {
+        let with_json = chat_completion_payload("model", "prompt", true);
+        assert_eq!(with_json["response_format"]["type"], "json_object");
+        assert_eq!(with_json["stream"], false);
+
+        let without_json = chat_completion_payload("model", "prompt", false);
+        assert!(without_json.get("response_format").is_none());
+    }
 }
