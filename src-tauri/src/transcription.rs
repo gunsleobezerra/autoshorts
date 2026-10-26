@@ -772,3 +772,158 @@ if __name__ == "__main__":
         .context("spawn_blocking failed")?
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn word(text: &str, start: f64, end: f64, speaker: &str) -> TranscriptWord {
+        TranscriptWord {
+            text: text.to_string(),
+            start,
+            end,
+            speaker: Some(speaker.to_string()),
+        }
+    }
+
+    #[test]
+    fn parses_percentage_from_download_output() {
+        assert_eq!(parse_percentage("Downloading 45%"), Some(45.0));
+        assert_eq!(parse_percentage("12.5%"), Some(12.5));
+        assert_eq!(parse_percentage("100% complete"), Some(100.0));
+        assert_eq!(parse_percentage("no percent here"), None);
+        assert_eq!(parse_percentage("%"), None);
+    }
+
+    #[test]
+    fn parses_whisper_timestamps() {
+        assert_eq!(parse_timestamp_token("00:00:05.500"), Some(5.5));
+        assert_eq!(parse_timestamp_token("00:01:02.500"), Some(62.5));
+        assert_eq!(parse_timestamp_token("01:02"), Some(62.0));
+        assert_eq!(parse_timestamp_token("5.5"), Some(5.5));
+        assert_eq!(parse_timestamp_token("not-a-time"), None);
+        assert_eq!(parse_timestamp_token("1:2:3:4"), None);
+    }
+
+    #[test]
+    fn parses_segment_end_from_whisper_output_line() {
+        let line = "[00:00:00.000 --> 00:00:05.500]  hello world";
+        assert_eq!(parse_segment_end_sec(line), Some(5.5));
+        assert_eq!(parse_segment_end_sec("no timestamps here"), None);
+    }
+
+    #[test]
+    fn build_segments_returns_empty_for_no_words() {
+        assert!(build_segments(&[]).is_empty());
+    }
+
+    #[test]
+    fn build_segments_joins_words_until_a_break() {
+        let words = vec![
+            word("Hello", 0.0, 0.5, "S1"),
+            word("world.", 0.6, 1.0, "S1"),
+            word("Next", 2.0, 2.5, "S1"),
+            word("speaker", 2.6, 3.0, "S2"),
+            word("here.", 3.1, 3.5, "S2"),
+        ];
+
+        let segments = build_segments(&words);
+        assert_eq!(segments.len(), 3);
+        assert_eq!(segments[0].text, "Hello world.");
+        assert_eq!(segments[0].start, 0.0);
+        assert_eq!(segments[0].end, 1.0);
+        assert_eq!(segments[1].text, "Next");
+        assert_eq!(segments[2].text, "speaker here.");
+        assert_eq!(segments[2].speaker.as_deref(), Some("S2"));
+    }
+
+    #[test]
+    fn build_segments_breaks_after_sentence_end() {
+        let words = vec![
+            word("Done.", 0.0, 0.5, "S1"),
+            word("Again", 0.6, 1.0, "S1"),
+        ];
+
+        let segments = build_segments(&words);
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].text, "Done.");
+        assert_eq!(segments[1].text, "Again");
+    }
+
+    #[test]
+    fn normalizes_deepgram_response() {
+        let value = json!({
+            "metadata": { "language": "pt", "duration": 12.5 },
+            "results": {
+                "channels": [{
+                    "alternatives": [{
+                        "words": [
+                            { "word": "hello", "punctuated_word": "Hello", "start": 0.0, "end": 0.4, "speaker": 0 },
+                            { "word": "", "start": 0.4, "end": 0.5, "speaker": 0 },
+                            { "word": "world", "start": 0.5, "end": 0.9, "speaker": 1 }
+                        ]
+                    }]
+                }]
+            }
+        });
+
+        let transcript = normalize_deepgram(value).unwrap();
+        assert_eq!(transcript.language, "pt");
+        assert_eq!(transcript.duration, 12.5);
+        assert_eq!(transcript.words.len(), 2);
+        assert_eq!(transcript.words[0].text, "Hello");
+        assert_eq!(transcript.speakers, vec!["S1".to_string(), "S2".to_string()]);
+        assert!(!transcript.segments.is_empty());
+    }
+
+    #[test]
+    fn deepgram_response_without_alternative_is_an_error() {
+        let value = json!({ "metadata": {} });
+        assert!(normalize_deepgram(value).is_err());
+    }
+
+    #[test]
+    fn deepgram_response_without_words_is_an_error() {
+        let value = json!({
+            "results": { "channels": [{ "alternatives": [{}] }] }
+        });
+        assert!(normalize_deepgram(value).is_err());
+    }
+
+    #[test]
+    fn normalizes_whisper_raw_json() {
+        let raw = json!({
+            "language": "es",
+            "segments": [{
+                "start": 0.0,
+                "end": 1.5,
+                "text": " hola mundo ",
+                "words": [
+                    { "word": " hola ", "start": 0.0, "end": 0.6 },
+                    { "word": " mundo ", "start": 0.6, "end": 1.5 }
+                ]
+            }]
+        });
+
+        let transcript = normalize_whisper_raw_json(raw).unwrap();
+        assert_eq!(transcript.language, "es");
+        assert_eq!(transcript.duration, 1.5);
+        assert_eq!(transcript.segments.len(), 1);
+        assert_eq!(transcript.segments[0].text, "hola mundo");
+        assert_eq!(transcript.words.len(), 2);
+        assert_eq!(transcript.words[1].text, "mundo");
+        assert_eq!(transcript.speakers, vec!["S1".to_string()]);
+    }
+
+    #[test]
+    fn whisper_json_without_segments_is_an_error() {
+        assert!(normalize_whisper_raw_json(json!({ "language": "en" })).is_err());
+    }
+
+    #[test]
+    fn whisper_model_catalog_is_not_empty() {
+        assert!(!WHISPER_MODELS.is_empty());
+        assert!(list_whisper_models().len() == WHISPER_MODELS.len());
+    }
+}
