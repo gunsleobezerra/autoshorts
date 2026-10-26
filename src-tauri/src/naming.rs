@@ -5,8 +5,6 @@
 //! rank and the hook line, then sanitized so they stay valid on Linux, macOS
 //! and Windows (no reserved characters, no trailing dots or spaces).
 
-use std::path::{Path, PathBuf};
-
 /// Longest hook fragment kept in a file name. Enough to be descriptive while
 /// staying well below the 255-byte limit of common file systems.
 const MAX_HOOK_LEN: usize = 60;
@@ -121,36 +119,6 @@ pub fn clip_file_name(
     format!("{project}_{:02}_{suffix}.mp4", rank.max(1))
 }
 
-/// Return `dir/file_name`, appending `-2`, `-3`, … when the file exists.
-///
-/// Re-cutting a clip overwrites its previous render only when the name still
-/// matches; a renamed hook therefore produces a new file instead of silently
-/// replacing the old one.
-pub fn unique_path(dir: &Path, file_name: &str) -> PathBuf {
-    let candidate = dir.join(file_name);
-    if !candidate.exists() {
-        return candidate;
-    }
-
-    let path = Path::new(file_name);
-    let stem = path
-        .file_stem()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| "clip".to_string());
-    let extension = path
-        .extension()
-        .map(|e| e.to_string_lossy().to_string())
-        .unwrap_or_else(|| "mp4".to_string());
-
-    for index in 2..1000 {
-        let next = dir.join(format!("{stem}-{index}.{extension}"));
-        if !next.exists() {
-            return next;
-        }
-    }
-    candidate
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,35 +177,5 @@ mod tests {
     fn clip_file_name_survives_empty_project_slug() {
         let name = clip_file_name("", 2, "hook", 0.0, 30.0);
         assert_eq!(name, "clip_02_hook.mp4");
-    }
-
-    #[test]
-    fn unique_path_returns_plain_name_when_free() {
-        let dir = std::env::temp_dir().join(format!("autoshorts-naming-{}", uuid_like()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = unique_path(&dir, "clip.mp4");
-        assert_eq!(path, dir.join("clip.mp4"));
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn unique_path_appends_counter_when_taken() {
-        let dir = std::env::temp_dir().join(format!("autoshorts-naming-{}", uuid_like()));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("clip.mp4"), b"x").unwrap();
-        let path = unique_path(&dir, "clip.mp4");
-        assert_eq!(path, dir.join("clip-2.mp4"));
-        std::fs::write(dir.join("clip-2.mp4"), b"x").unwrap();
-        assert_eq!(unique_path(&dir, "clip.mp4"), dir.join("clip-3.mp4"));
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    fn uuid_like() -> String {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        format!("{nanos}")
     }
 }

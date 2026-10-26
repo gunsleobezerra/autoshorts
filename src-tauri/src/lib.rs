@@ -642,7 +642,9 @@ async fn render_flat_clip_for_candidate(
                     candidate.start_sec,
                     candidate.end_sec,
                 );
-                naming::unique_path(&clips_dir, &file_name)
+                // Deterministic name on purpose: re-cutting a clip replaces its
+                // previous render instead of piling up `-2`, `-3` duplicates.
+                clips_dir.join(file_name)
             }
             Err(error) => {
                 // Surface the failure as a clip error instead of leaving the
