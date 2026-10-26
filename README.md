@@ -46,6 +46,10 @@ To run the application, **FFmpeg & FFprobe** must be installed and available on 
   sudo dnf install ffmpeg      # Fedora
   ```
 
+Building from source also needs **Node.js 22.19+** and a **Rust** toolchain;
+`npm test` refuses to start on older Node versions (see
+[Run the Tests](#4-run-the-tests)).
+
 ---
 
 ## Installation Guide (For Users)
