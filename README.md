@@ -157,7 +157,38 @@ npm run tauri:build
 ```
 The output installers will be built under `src-tauri/target/release/bundle/`.
 
-### 4. Multi-Platform Build (Windows + Linux + Android + iOS)
+### 4. Run the Tests
+Rust unit tests live next to the code they cover (`#[cfg(test)]` modules in
+`src-tauri/src/*.rs`); the SQLite layer is covered end to end from
+`src-tauri/tests/db_integration.rs` against a temporary database file:
+
+```bash
+cargo test --manifest-path src-tauri/Cargo.toml
+# or
+npm run test:rust
+```
+
+Frontend tests use Vitest + Testing Library with a jsdom environment:
+
+```bash
+npm test              # single run
+npm run test:watch    # watch mode
+```
+
+Test layout:
+
+| Path | Kind | Covers |
+| --- | --- | --- |
+| `src-tauri/src/lib.rs` | unit | SRT/ASS caption generation, slug + extension validation |
+| `src-tauri/src/media.rs` | unit | ffmpeg progress parsing, ASS filter escaping, path handling |
+| `src-tauri/src/transcription.rs` | unit | Whisper/Deepgram normalization, segment building, download progress |
+| `src-tauri/src/llm.rs` | unit | LLM response parsing, SSE streaming, URL normalization |
+| `src-tauri/tests/db_integration.rs` | integration | projects, transcripts, candidates, clips, cascade deletes, migrations |
+| `src/lib/format.test.ts` | unit | duration/size/file-name formatting helpers |
+| `src/components/common.test.tsx` | component | `PipelineStep`, `EmptyState`, `StatusPill` |
+| `src/App.integration.test.tsx` | integration | onboarding gate, sidebar rendering, project detail loading (Tauri IPC mocked) |
+
+### 5. Multi-Platform Build (Windows + Linux + Android + iOS)
 One command attempts every platform the current host can actually target:
 ```bash
 npm run build:all
