@@ -1,11 +1,11 @@
-mod db;
+pub mod db;
 pub mod hardware;
-mod llm;
-mod media;
-mod models;
+pub mod llm;
+pub mod media;
+pub mod models;
 pub mod naming;
-mod progress;
-mod transcription;
+pub mod progress;
+pub mod transcription;
 
 use std::path::PathBuf;
 
@@ -1389,7 +1389,7 @@ fn build_drawtext_filters(
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
 
     #[test]
