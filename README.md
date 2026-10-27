@@ -188,7 +188,7 @@ Test layout:
 | `src/components/common.test.tsx` | component | `PipelineStep`, `EmptyState`, `StatusPill` |
 | `src/App.integration.test.tsx` | integration | onboarding gate, sidebar rendering, project detail loading (Tauri IPC mocked) |
 
-### 5. Multi-Platform Build (Windows + Linux + Android + iOS)
+### 5. Multi-Platform Build (Windows + Linux + macOS)
 One command attempts every platform the current host can actually target:
 ```bash
 npm run build:all
@@ -198,10 +198,9 @@ Each platform is detected first; unsupported ones are skipped with the reason in
 ```bash
 npm run build:linux     # .deb / .rpm / .AppImage
 npm run build:windows   # .msi / NSIS .exe
-npm run build:android   # .apk / .aab
-npm run build:ios       # .app / .ipa (macOS only)
+npm run build:macos     # .dmg / .app (macOS only)
 
-npm run build:all -- --only=linux,android   # subset
+npm run build:all -- --only=linux,macos     # subset
 npm run build:all -- --skip=windows         # exclude one
 npm run build:all -- --dry-run              # print commands only
 ```
@@ -212,8 +211,7 @@ Host capability matrix:
 | --- | --- |
 | Linux | Linux host + `webkit2gtk-4.1`, `gtk+-3.0`, `libsoup-3.0` (pkg-config) |
 | Windows | Windows host, **or** WSL with Windows `cargo.exe` + `node.exe` + MSVC Build Tools. From WSL the source is mirrored to `%USERPROFILE%\autoshorts-build` and built by the Windows toolchain. |
-| Android | `ANDROID_HOME` (or `~/Android/Sdk`) with NDK, JDK 17, Android Rust targets (added automatically). `tauri android init` runs on first build. |
-| iOS | macOS + Xcode only. Cannot be produced from Linux/WSL — use a Mac or the `Release App` GitHub workflow. |
+| macOS | macOS + Xcode only. Cannot be produced from Linux/WSL — use a Mac or the `Release App` GitHub workflow. |
 
 <a id="support"></a>
 

@@ -3,7 +3,7 @@
  * Build AutoShorts for every platform the current host is able to target.
  *
  *   npm run build:all                  # tenta todas as plataformas disponíveis
- *   npm run build:all -- --only=linux,android
+ *   npm run build:all -- --only=linux,macos
  *   npm run build:all -- --skip=windows
  *   npm run build:all -- --dry-run     # mostra os comandos sem executar
  *
@@ -11,15 +11,13 @@
  *   - Linux   : nativo (deb/rpm/AppImage)
  *   - Windows : nativo no Windows; a partir do WSL usa o toolchain do Windows
  *               (cargo.exe + node.exe + MSVC Build Tools) num diretório de staging
- *   - Android : Android SDK + NDK + JDK + rust targets android
- *   - iOS     : SOMENTE macOS + Xcode (impossível a partir de Linux/WSL)
+ *   - macOS   : SOMENTE macOS + Xcode (impossível a partir de Linux/WSL)
  *
  * Artefatos finais são copiados para `artifacts/<plataforma>/`.
  * O script continua nas demais plataformas quando uma falha ou é pulada.
  */
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -190,25 +188,6 @@ const winToolchain = (() => {
   };
 })();
 
-const androidSdk = () =>
-  firstExisting([
-    process.env.ANDROID_HOME,
-    process.env.ANDROID_SDK_ROOT,
-    path.join(os.homedir(), 'Android/Sdk'),
-  ]);
-
-const ANDROID_RUST_TARGETS = [
-  'aarch64-linux-android',
-  'armv7-linux-androideabi',
-  'i686-linux-android',
-  'x86_64-linux-android',
-];
-
-function installedRustTargets() {
-  const out = capture('rustup', ['target', 'list', '--installed']);
-  return out ? out.split('\n').map((l) => l.trim()) : [];
-}
-
 /* ------------------------------------------------------------ build targets */
 
 const targets = [
@@ -332,50 +311,18 @@ const targets = [
     },
   },
   {
-    id: 'android',
-    label: 'Android (.apk / .aab)',
+    id: 'macos',
+    label: 'macOS (.dmg / .app)',
     reason() {
-      const sdk = androidSdk();
-      if (!sdk) return 'Android SDK não encontrado (defina ANDROID_HOME ou instale ~/Android/Sdk)';
-      if (!fs.existsSync(path.join(sdk, 'ndk'))) return `NDK não encontrado em ${sdk}/ndk`;
-      if (!which('java')) return 'JDK não encontrado (instale openjdk-17)';
-      return null;
-    },
-    build() {
-      const missingTargets = ANDROID_RUST_TARGETS.filter((t) => !installedRustTargets().includes(t));
-      if (missingTargets.length) {
-        const res = run('rustup', ['target', 'add', ...missingTargets]);
-        if (res.status !== 0) throw new Error('`rustup target add` para Android falhou');
-      }
-      if (!fs.existsSync(path.join(ROOT, 'src-tauri/gen/android'))) {
-        const res = run('npx', ['tauri', 'android', 'init']);
-        if (res.status !== 0) throw new Error('`tauri android init` falhou');
-      }
-      const res = run('npx', ['tauri', 'android', 'build']);
-      if (res.status !== 0) throw new Error('`tauri android build` falhou');
-      collect(
-        'android',
-        [path.join(ROOT, 'src-tauri/gen/android/app/build/outputs')],
-        ['.apk', '.aab'],
-      );
-    },
-  },
-  {
-    id: 'ios',
-    label: 'iOS (.app / .ipa)',
-    reason() {
-      if (!IS_MAC) return 'iOS exige macOS + Xcode — impossível compilar a partir de Linux/WSL';
+      if (!IS_MAC) return 'macOS exige macOS + Xcode — impossível compilar a partir de Linux/WSL';
       if (!which('xcodebuild')) return 'Xcode não instalado';
       return null;
     },
     build() {
-      if (!fs.existsSync(path.join(ROOT, 'src-tauri/gen/apple'))) {
-        const res = run('npx', ['tauri', 'ios', 'init']);
-        if (res.status !== 0) throw new Error('`tauri ios init` falhou');
-      }
-      const res = run('npx', ['tauri', 'ios', 'build']);
-      if (res.status !== 0) throw new Error('`tauri ios build` falhou');
-      collect('ios', [path.join(ROOT, 'src-tauri/gen/apple/build')], ['.ipa', '.app']);
+      const bundles = process.env.MACOS_BUNDLES ?? 'app,dmg';
+      const res = run('npx', ['tauri', 'build', '--bundles', bundles]);
+      if (res.status !== 0) throw new Error('`tauri build` falhou');
+      collect('macos', [path.join(ROOT, 'src-tauri/target/release/bundle')], ['.dmg', '.app']);
     },
   },
 ];
