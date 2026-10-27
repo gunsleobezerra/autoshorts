@@ -52,7 +52,7 @@ jobs:
         run: cargo test --manifest-path src-tauri/Cargo.toml --all-targets
 
   release:
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push'
     needs: test
     permissions:
       contents: write
@@ -97,7 +97,7 @@ jobs:
   android:
     needs: test
     if: 
-      github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')  
+      github.event_name == 'push'
     permissions:
       contents: write
     runs-on: ubuntu-22.04
@@ -159,7 +159,7 @@ jobs:
   ios:
     needs: test
     if: 
-      github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+      github.event_name == 'push'
     permissions:
       contents: write
     runs-on: macos-latest
