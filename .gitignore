@@ -6,3 +6,6 @@ src-tauri/target
 .DS_Store
 *.log
 artifacts
+# Project builds with npm; a stray bun lockfile makes tauri-action pick bun.
+bun.lock
+bun.lockb

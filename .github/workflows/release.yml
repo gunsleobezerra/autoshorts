@@ -52,7 +52,9 @@ jobs:
         run: cargo test --manifest-path src-tauri/Cargo.toml --all-targets
 
   release:
-    if: github.event_name == 'push'
+    # Only real version tags cut a release. On a push to `main` `github.ref_name`
+    # is literally "main", which used to create a bogus `main` tag/release.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     needs: test
     permissions:
       contents: write
@@ -69,6 +71,7 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 22
+          cache: npm
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -80,6 +83,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
 
+      # `bun.lock` used to be committed, which made tauri-action pick bun and fail
+      # with "'bun' is not recognized". package.json now pins npm via packageManager.
+      - name: Assert npm is the package manager
+        shell: bash
+        run: |
+          test ! -f bun.lock && test ! -f bun.lockb
+          node -e "const pm=require('./package.json').packageManager||''; if(!pm.startsWith('npm@')) { console.error('packageManager must pin npm, got: '+pm); process.exit(1); }"
+
       - name: Install node modules
         run: npm ci
 
@@ -88,6 +99,9 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
+          # Pinned explicitly: tauri-action picks the runner from lockfiles, and a
+          # committed `bun.lock` made it run `bun tauri build` on runners without bun.
+          tauriScript: npm run tauri
           tagName: ${{ github.ref_name }}
           releaseName: 'AutoShorts ${{ github.ref_name }}'
           releaseBody: 'See release notes for installation details.'
