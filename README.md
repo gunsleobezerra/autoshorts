@@ -88,7 +88,7 @@ When you first launch the application, you will be greeted by an **Onboarding Wi
 
 #### Option A: Fully Offline (Ollama + Whisper)
 1. **Ollama Setup**: Select a local model card (`llama3.2 3B`, `qwen2.5 3B`, or `qwen2.5 7B`). The application will check if Ollama is running and automatically pull the model weights, showing a downloader progress bar.
-2. **Local Whisper**: Follow the prompt instructions to verify Python is installed and run `pip3 install openai-whisper` to enable fully offline transcription.
+2. **Local Whisper**: Click **Instalar Whisper**. The app creates a virtualenv under its data directory (`python-venv`) and installs `openai-whisper` into it, so nothing is added to your system Python. The first install downloads PyTorch (~1–2 GB). Only a Python 3 interpreter is required — the Linux packages declare `python3`/`python3-venv` as dependencies.
 
 #### Option B: Cloud API Keys
 1. Enter your API credentials for:

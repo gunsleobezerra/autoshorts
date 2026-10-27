@@ -576,11 +576,13 @@ pub async fn transcribe_local(
             // fails hard on `--device cuda` when CUDA is unavailable.
             let device = crate::hardware::whisper_device();
 
+            // Resolved once: probing the venv spawns the CLI, which imports
+            // torch, so it must not run again for the CPU retry below.
+            let whisper_cli = crate::python_env::active_whisper_cli()
+                .unwrap_or_else(|| std::path::PathBuf::from("whisper"));
+
             let build = |device: Option<&str>| {
-                // Prefer the venv's console script over whatever is on PATH.
-                let cli = crate::python_env::active_whisper_cli()
-                    .unwrap_or_else(|| std::path::PathBuf::from("whisper"));
-                let mut cmd = std::process::Command::new(cli);
+                let mut cmd = std::process::Command::new(&whisper_cli);
                 cmd.arg(&audio_path)
                     .args(["--model", &cli_model])
                     .args(["--output_format", "json"])
