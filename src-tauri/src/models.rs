@@ -140,6 +140,108 @@ pub struct ClipEdit {
     /// `caption_style` field by field.
     #[serde(default)]
     pub caption_override: Option<CaptionStyleOverride>,
+    /// Automatic tight-cut settings (silence removal + pacing).
+    #[serde(default)]
+    pub auto_edit: Option<AutoEditSettings>,
+}
+
+/// Auto-edit knobs for one clip.
+///
+/// `silence_mode` decides what happens to a detected pause: `cut` removes it
+/// (jump cut) while `speed` keeps it but plays it faster, which reads as a
+/// natural time-lapse instead of a hard jump.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoEditSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Loudness below which audio counts as silence, in dBFS.
+    #[serde(default = "default_silence_threshold_db")]
+    pub silence_threshold_db: f64,
+    /// Shortest pause worth touching, in seconds.
+    #[serde(default = "default_min_silence_sec")]
+    pub min_silence_sec: f64,
+    /// Audio kept on each side of a cut, so consonants are not clipped.
+    #[serde(default = "default_padding_sec")]
+    pub padding_sec: f64,
+    /// `cut` or `speed`.
+    #[serde(default = "default_silence_mode")]
+    pub silence_mode: String,
+    /// Playback rate used when `silence_mode` is `speed`.
+    #[serde(default = "default_silence_speed")]
+    pub silence_speed: f64,
+    /// Alternating punch-in zoom on speech segments; 1.0 disables it.
+    #[serde(default = "default_punch_in_zoom")]
+    pub punch_in_zoom: f64,
+}
+
+fn default_silence_threshold_db() -> f64 {
+    -32.0
+}
+
+fn default_min_silence_sec() -> f64 {
+    0.45
+}
+
+fn default_padding_sec() -> f64 {
+    0.08
+}
+
+fn default_silence_mode() -> String {
+    "cut".to_string()
+}
+
+fn default_silence_speed() -> f64 {
+    1.6
+}
+
+fn default_punch_in_zoom() -> f64 {
+    1.0
+}
+
+impl Default for AutoEditSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            silence_threshold_db: default_silence_threshold_db(),
+            min_silence_sec: default_min_silence_sec(),
+            padding_sec: default_padding_sec(),
+            silence_mode: default_silence_mode(),
+            silence_speed: default_silence_speed(),
+            punch_in_zoom: default_punch_in_zoom(),
+        }
+    }
+}
+
+impl AutoEditSettings {
+    /// True when detected pauses should be kept and accelerated.
+    pub fn keeps_silence(&self) -> bool {
+        self.silence_mode == "speed"
+    }
+
+    /// Clamp every value into a range the renderer can honour.
+    pub fn sanitized(mut self) -> Self {
+        self.silence_threshold_db = clamp_finite(self.silence_threshold_db, -60.0, -8.0, -32.0);
+        self.min_silence_sec = clamp_finite(self.min_silence_sec, 0.15, 5.0, 0.45);
+        self.padding_sec = clamp_finite(self.padding_sec, 0.0, 0.5, 0.08);
+        self.silence_speed = clamp_finite(self.silence_speed, 1.1, 4.0, 1.6);
+        self.punch_in_zoom = clamp_finite(self.punch_in_zoom, 1.0, 1.4, 1.0);
+        let mode = self.silence_mode.trim().to_ascii_lowercase();
+        self.silence_mode = if mode == "speed" {
+            "speed".to_string()
+        } else {
+            "cut".to_string()
+        };
+        self
+    }
+}
+
+fn clamp_finite(value: f64, min: f64, max: f64, fallback: f64) -> f64 {
+    if value.is_finite() {
+        value.clamp(min, max)
+    } else {
+        fallback
+    }
 }
 
 /// Caption look edited in the clip editor.
@@ -235,6 +337,7 @@ impl ClipEdit {
             captions: Vec::new(),
             caption_style: None,
             caption_override: None,
+            auto_edit: None,
         }
     }
 
@@ -248,6 +351,7 @@ impl ClipEdit {
             .map(|style| style.trim().to_string())
             .filter(|style| !style.is_empty());
         self.caption_override = self.caption_override.map(|value| value.sanitized());
+        self.auto_edit = self.auto_edit.map(|value| value.sanitized());
         self.captions.retain(|cue| cue.end > cue.start && !cue.text.trim().is_empty());
         self
     }

@@ -14,8 +14,10 @@ import {
 import {
   ASPECT_PRESETS,
   CAPTION_STYLES,
+  DEFAULT_AUTO_EDIT,
   DEFAULT_CAPTION_STYLE,
   FONT_FAMILIES,
+  autoEditSummary,
   canPlayDirectly,
   captionPreviewStyle,
   clampCues,
@@ -24,6 +26,7 @@ import {
   isLinuxWebview,
   needsProxyFor,
   normalizeAspect,
+  normalizeAutoEdit,
   resolveCaptionStyle,
   sanitizeHex,
   stageMaxWidth,
@@ -31,6 +34,7 @@ import {
   toSourceTime,
 } from "../lib/clipEditor";
 import type {
+  AutoEditSettings,
   CaptionCue,
   CaptionStyleOverride,
   ClipEdit,
@@ -99,6 +103,7 @@ export function ClipEditor({ candidateId, onClose, onSaved, onBulkSaved, onRange
   const [cues, setCues] = useState<CaptionCue[]>([]);
   const [captionStyle, setCaptionStyle] = useState(DEFAULT_CAPTION_STYLE);
   const [captionOverride, setCaptionOverride] = useState<CaptionStyleOverride>({});
+  const [autoEdit, setAutoEdit] = useState<AutoEditSettings>(DEFAULT_AUTO_EDIT);
 
   const [currentTime, setCurrentTime] = useState(0);
   const [playing, setPlaying] = useState(false);
@@ -135,6 +140,7 @@ export function ClipEditor({ candidateId, onClose, onSaved, onBulkSaved, onRange
       setCues(Array.isArray(payload.cues) ? payload.cues : payload.edit?.captions ?? []);
       setCaptionStyle(payload.captionStyle || payload.edit?.captionStyle || DEFAULT_CAPTION_STYLE);
       setCaptionOverride(payload.edit?.captionOverride ?? {});
+      setAutoEdit({ ...DEFAULT_AUTO_EDIT, ...(payload.edit?.autoEdit ?? {}) });
       setRangeStart(payload.candidate?.startSec ?? 0);
       setRangeEnd(payload.candidate?.endSec ?? 0);
       setStyleNotice(null);
@@ -369,6 +375,10 @@ export function ClipEditor({ candidateId, onClose, onSaved, onBulkSaved, onRange
     setCaptionOverride((current) => ({ ...current, ...patch }));
   }
 
+  function updateAutoEdit(patch: Partial<AutoEditSettings>) {
+    setAutoEdit((current) => ({ ...current, ...patch }));
+  }
+
   /** Drop every override so the preset renders untouched again. */
   function resetOverride() {
     setCaptionOverride({});
@@ -464,6 +474,7 @@ export function ClipEditor({ candidateId, onClose, onSaved, onBulkSaved, onRange
       captions: clampCues(cues, 0, Number.POSITIVE_INFINITY),
       captionStyle: captionStyle || DEFAULT_CAPTION_STYLE,
       captionOverride: hasOverride ? captionOverride : null,
+      autoEdit: autoEdit.enabled ? normalizeAutoEdit(autoEdit) : null,
     };
     try {
       const saved = await invoke<ClipEdit>("save_clip_edit", { edit });
@@ -737,6 +748,152 @@ export function ClipEditor({ candidateId, onClose, onSaved, onBulkSaved, onRange
               </div>
 
               <div className="clip-editor-side">
+                <details className="clip-editor-style clip-editor-autoedit" open>
+                  <summary>Auto-edit: cortar silêncios</summary>
+
+                  <div className="clip-editor-toggles">
+                    <label>
+                      <input
+                        type="checkbox"
+                        aria-label="Ativar auto-edit"
+                        checked={autoEdit.enabled}
+                        onChange={(event) => updateAutoEdit({ enabled: event.target.checked })}
+                      />
+                      Deixar o vídeo dinâmico
+                    </label>
+                  </div>
+
+                  <p className="clip-editor-autoedit-summary" role="status">
+                    {autoEditSummary(autoEdit)}
+                  </p>
+
+                  {autoEdit.enabled && (
+                    <>
+                      <div className="clip-editor-field">
+                        <label htmlFor="clip-editor-autoedit-threshold">
+                          Limite de silêncio{" "}
+                          <span>{Math.round(autoEdit.silenceThresholdDb)} dB</span>
+                        </label>
+                        <input
+                          id="clip-editor-autoedit-threshold"
+                          type="range"
+                          min={-60}
+                          max={-8}
+                          step={1}
+                          value={autoEdit.silenceThresholdDb}
+                          onChange={(event) =>
+                            updateAutoEdit({ silenceThresholdDb: Number(event.target.value) })
+                          }
+                        />
+                      </div>
+
+                      <div className="clip-editor-field">
+                        <label htmlFor="clip-editor-autoedit-min">
+                          Pausa mínima{" "}
+                          <span>{autoEdit.minSilenceSec.toFixed(2)}s</span>
+                        </label>
+                        <input
+                          id="clip-editor-autoedit-min"
+                          type="range"
+                          min={0.15}
+                          max={3}
+                          step={0.05}
+                          value={autoEdit.minSilenceSec}
+                          onChange={(event) =>
+                            updateAutoEdit({ minSilenceSec: Number(event.target.value) })
+                          }
+                        />
+                      </div>
+
+                      <div className="clip-editor-field">
+                        <label htmlFor="clip-editor-autoedit-padding">
+                          Respiro nas bordas{" "}
+                          <span>{Math.round(autoEdit.paddingSec * 1000)}ms</span>
+                        </label>
+                        <input
+                          id="clip-editor-autoedit-padding"
+                          type="range"
+                          min={0}
+                          max={0.5}
+                          step={0.01}
+                          value={autoEdit.paddingSec}
+                          onChange={(event) =>
+                            updateAutoEdit({ paddingSec: Number(event.target.value) })
+                          }
+                        />
+                      </div>
+
+                      <div className="clip-editor-field">
+                        <label htmlFor="clip-editor-autoedit-mode">Nas pausas</label>
+                        <select
+                          id="clip-editor-autoedit-mode"
+                          value={autoEdit.silenceMode}
+                          onChange={(event) =>
+                            updateAutoEdit({
+                              silenceMode: event.target.value === "speed" ? "speed" : "cut",
+                            })
+                          }
+                        >
+                          <option value="cut">Cortar (jump cut)</option>
+                          <option value="speed">Acelerar</option>
+                        </select>
+                      </div>
+
+                      {autoEdit.silenceMode === "speed" && (
+                        <div className="clip-editor-field">
+                          <label htmlFor="clip-editor-autoedit-speed">
+                            Velocidade da pausa{" "}
+                            <span>{autoEdit.silenceSpeed.toFixed(2)}x</span>
+                          </label>
+                          <input
+                            id="clip-editor-autoedit-speed"
+                            type="range"
+                            min={1.1}
+                            max={4}
+                            step={0.1}
+                            value={autoEdit.silenceSpeed}
+                            onChange={(event) =>
+                              updateAutoEdit({ silenceSpeed: Number(event.target.value) })
+                            }
+                          />
+                        </div>
+                      )}
+
+                      <div className="clip-editor-field">
+                        <label htmlFor="clip-editor-autoedit-punch">
+                          Zoom dinâmico{" "}
+                          <span>
+                            {autoEdit.punchInZoom > 1
+                              ? `${autoEdit.punchInZoom.toFixed(2)}x`
+                              : "desligado"}
+                          </span>
+                        </label>
+                        <input
+                          id="clip-editor-autoedit-punch"
+                          type="range"
+                          min={1}
+                          max={1.4}
+                          step={0.01}
+                          value={autoEdit.punchInZoom}
+                          onChange={(event) =>
+                            updateAutoEdit({ punchInZoom: Number(event.target.value) })
+                          }
+                        />
+                      </div>
+
+                      <div className="clip-editor-style-actions">
+                        <button
+                          className="clip-editor-center"
+                          onClick={() => setAutoEdit(DEFAULT_AUTO_EDIT)}
+                        >
+                          <RotateCcw size={14} />
+                          Resetar auto-edit
+                        </button>
+                      </div>
+                    </>
+                  )}
+                </details>
+
                 <div className="clip-editor-field">
                   <label htmlFor="clip-editor-caption-style">Caption style</label>
                   <select

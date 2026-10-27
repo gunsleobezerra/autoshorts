@@ -397,6 +397,7 @@ fn clip_edits_round_trip_with_captions() {
         ],
         caption_style: Some("classic-outline".to_string()),
         caption_override: None,
+        auto_edit: None,
     };
 
     let stored = db.save_clip_edit(&edit).expect("saving edit");
@@ -456,6 +457,7 @@ fn save_clip_edit_sanitizes_out_of_range_values() {
             }],
             caption_style: Some("   ".to_string()),
             caption_override: None,
+            auto_edit: None,
         })
         .expect("saving edit");
 
@@ -499,6 +501,7 @@ fn caption_override_round_trips_and_sanitizes() {
             position: Some(0.25),
             max_width: Some(0.8),
         }),
+        auto_edit: None,
     };
 
     let stored = db.save_clip_edit(&edit).expect("saving edit");

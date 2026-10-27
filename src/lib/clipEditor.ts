@@ -47,6 +47,32 @@ export type ClipEdit = {
   captions: CaptionCue[];
   captionStyle: string | null;
   captionOverride?: CaptionStyleOverride | null;
+  autoEdit?: AutoEditSettings | null;
+};
+
+/** How the renderer treats detected silence. */
+export type AutoEditSilenceMode = "cut" | "speed";
+
+/**
+ * Per-clip auto-edit settings.
+ *
+ * Mirrors `models::AutoEditSettings`: the backend detects pauses with
+ * ffmpeg `silencedetect`, protects anything the transcript says is spoken, and
+ * then either removes the pause (`cut`) or plays it faster (`speed`).
+ */
+export type AutoEditSettings = {
+  enabled: boolean;
+  /** dBFS floor below which a stretch counts as silence. */
+  silenceThresholdDb: number;
+  /** Shortest pause worth touching, in seconds. */
+  minSilenceSec: number;
+  /** Breathing room kept on each side of a cut, in seconds. */
+  paddingSec: number;
+  silenceMode: AutoEditSilenceMode;
+  /** Playback rate applied to silence in `speed` mode. */
+  silenceSpeed: number;
+  /** Punch-in factor applied to alternating realtime segments (1 = off). */
+  punchInZoom: number;
 };
 
 export type ClipEditorCandidate = {
@@ -130,6 +156,93 @@ export const CAPTION_STYLES: Array<{ id: string; label: string }> = [
 ];
 
 export const DEFAULT_CAPTION_STYLE = "modern-box";
+
+/**
+ * Defaults for a fresh auto-edit config; kept in sync with the serde defaults
+ * of `models::AutoEditSettings`.
+ */
+export const DEFAULT_AUTO_EDIT: AutoEditSettings = {
+  enabled: false,
+  silenceThresholdDb: -32,
+  minSilenceSec: 0.45,
+  paddingSec: 0.08,
+  silenceMode: "cut",
+  silenceSpeed: 1.6,
+  punchInZoom: 1,
+};
+
+/** Clamp ranges the backend enforces, so the UI can never send a rejected value. */
+const AUTO_EDIT_LIMITS = {
+  silenceThresholdDb: [-60, -8],
+  minSilenceSec: [0.15, 5],
+  paddingSec: [0, 0.5],
+  silenceSpeed: [1.1, 4],
+  punchInZoom: [1, 1.4],
+} as const;
+
+function clampInRange(value: number | null | undefined, min: number, max: number, fallback: number) {
+  if (value === null || value === undefined || !Number.isFinite(value)) return fallback;
+  return Math.min(max, Math.max(min, value));
+}
+
+/**
+ * Sanitize auto-edit settings the same way `AutoEditSettings::sanitized` does.
+ *
+ * `null`/`undefined` stays `null` so an untouched clip keeps storing "no
+ * auto-edit" instead of a default block nobody asked for.
+ */
+export function normalizeAutoEdit(
+  settings: AutoEditSettings | null | undefined,
+): AutoEditSettings | null {
+  if (!settings) return null;
+  const limits = AUTO_EDIT_LIMITS;
+  return {
+    enabled: Boolean(settings.enabled),
+    silenceThresholdDb: clampInRange(
+      settings.silenceThresholdDb,
+      limits.silenceThresholdDb[0],
+      limits.silenceThresholdDb[1],
+      DEFAULT_AUTO_EDIT.silenceThresholdDb,
+    ),
+    minSilenceSec: clampInRange(
+      settings.minSilenceSec,
+      limits.minSilenceSec[0],
+      limits.minSilenceSec[1],
+      DEFAULT_AUTO_EDIT.minSilenceSec,
+    ),
+    paddingSec: clampInRange(
+      settings.paddingSec,
+      limits.paddingSec[0],
+      limits.paddingSec[1],
+      DEFAULT_AUTO_EDIT.paddingSec,
+    ),
+    silenceMode: settings.silenceMode === "speed" ? "speed" : "cut",
+    silenceSpeed: clampInRange(
+      settings.silenceSpeed,
+      limits.silenceSpeed[0],
+      limits.silenceSpeed[1],
+      DEFAULT_AUTO_EDIT.silenceSpeed,
+    ),
+    punchInZoom: clampInRange(
+      settings.punchInZoom,
+      limits.punchInZoom[0],
+      limits.punchInZoom[1],
+      DEFAULT_AUTO_EDIT.punchInZoom,
+    ),
+  };
+}
+
+/** One-line description of what auto-edit will do, for the editor summary. */
+export function autoEditSummary(settings: AutoEditSettings | null | undefined): string {
+  const normalized = normalizeAutoEdit(settings);
+  if (!normalized || !normalized.enabled) return "Auto-edit desligado";
+  const mode =
+    normalized.silenceMode === "speed"
+      ? `pausas em ${Number(normalized.silenceSpeed.toFixed(2))}x`
+      : "pausas cortadas";
+  const punch = normalized.punchInZoom > 1 ? " + zoom dinâmico" : "";
+  return `${mode} abaixo de ${normalized.silenceThresholdDb} dB (>= ${normalized.minSilenceSec}s)${punch}`;
+}
 
 function clamp01(value: number): number {
   if (!Number.isFinite(value)) return 0;

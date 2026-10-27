@@ -7,6 +7,7 @@ use std::{
 use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
 
+use crate::autoedit::RenderSegment;
 use crate::hardware;
 use crate::models::MediaProbe;
 
@@ -411,6 +412,8 @@ pub struct ClipRenderRequest<'a> {
     pub output_path: &'a Path,
     /// Whether the source has a video stream (probed once by the caller).
     pub has_video: bool,
+    /// Whether the source has an audio stream (probed once by the caller).
+    pub has_audio: bool,
     /// Optional ASS subtitle file burned into the video.
     pub ass_path: Option<&'a Path>,
     /// Target aspect ratio; see [`normalize_aspect_ratio`].
@@ -419,6 +422,8 @@ pub struct ClipRenderRequest<'a> {
     pub crop_x: f64,
     /// Vertical crop position inside the slack, 0.0..=1.0.
     pub crop_y: f64,
+    /// Auto-edit cut list. Empty keeps the single-pass render path.
+    pub segments: &'a [RenderSegment],
 }
 
 fn absolute_path(path: &Path) -> PathBuf {
@@ -465,7 +470,16 @@ pub fn render_flat_clip(
         std::fs::create_dir_all(parent)?;
     }
 
-    let duration_sec = (request.end_sec - request.start_sec).max(0.1);
+    let duration_sec = if request.segments.is_empty() {
+        (request.end_sec - request.start_sec).max(0.1)
+    } else {
+        request
+            .segments
+            .iter()
+            .map(RenderSegment::output_len)
+            .sum::<f64>()
+            .max(0.1)
+    };
 
     // Normalize the ffmpeg progress stream (absolute media time) to the
     // 0..=100 window of this specific clip. `-ss` seeks before input
@@ -518,29 +532,67 @@ fn run_clip_ffmpeg(
     let source_arg = source_path.to_string_lossy().to_string();
     let output_arg = output_path.to_string_lossy().to_string();
     let start = format!("{:.3}", request.start_sec);
-    let duration = format!("{duration_sec:.3}");
+
+    let segments = relative_segments(request);
+    let auto_edit = !segments.is_empty()
+        && (segments.len() > 1
+            || (segments[0].speed - 1.0).abs() > 1e-3
+            || segments[0].zoom > 1.0 + 1e-9);
+
+    // The trim filters index into the *source* window, so with a cut list the
+    // input has to stay readable past the (shorter) output duration.
+    let input_duration = if auto_edit {
+        segments
+            .iter()
+            .map(|segment| segment.end)
+            .fold(0.0_f64, f64::max)
+            .max(0.1)
+    } else {
+        duration_sec
+    };
+    let duration = format!("{input_duration:.3}");
 
     let mut cmd = Command::new("ffmpeg");
     cmd.args(&plan.pre_input);
     cmd.args(["-y", "-ss", &start, "-i", &source_arg, "-t", &duration]);
 
     let mut ass_dir: Option<PathBuf> = None;
+    let mut ass_filter: Option<String> = None;
+    if let Some(ass_path) = request.ass_path {
+        let ass_path = absolute_path(ass_path);
+        if let Some(parent) = ass_path.parent() {
+            ass_dir = Some(parent.to_path_buf());
+        }
+        ass_filter = ass_filter_arg(&ass_path);
+    }
 
-    if request.has_video {
+    if auto_edit {
+        // Cut list path: trim every kept span, retime the accelerated ones and
+        // concatenate them back into one continuous clip. Captions were already
+        // remapped onto this compressed timeline by the caller.
+        let graph = auto_edit_filter_graph(request, &segments, ass_filter.as_deref(), plan.filter_suffix);
+        if graph.is_empty() {
+            return Err(anyhow!("auto-edit produced an empty filter graph"));
+        }
+        cmd.args(["-filter_complex", &graph]);
+        if request.has_video {
+            cmd.args(["-map", "[vout]"]);
+            cmd.args(&plan.codec);
+        } else {
+            cmd.arg("-vn");
+        }
+        if request.has_audio {
+            cmd.args(["-map", "[ca]"]);
+        }
+    } else if request.has_video {
         let mut filters = vec![crop_and_scale_filter(
             request.aspect_ratio,
             request.crop_x,
             request.crop_y,
         )];
 
-        if let Some(ass_path) = request.ass_path {
-            let ass_path = absolute_path(ass_path);
-            if let Some(parent) = ass_path.parent() {
-                ass_dir = Some(parent.to_path_buf());
-            }
-            if let Some(filter) = ass_filter_arg(&ass_path) {
-                filters.push(filter);
-            }
+        if let Some(filter) = ass_filter {
+            filters.push(filter);
         }
 
         let mut filter_chain = filters.join(",");
@@ -564,6 +616,124 @@ fn run_clip_ffmpeg(
     // `-progress` output is absolute media time, but `-ss` seeks before input
     // decoding, so reported positions already start near zero for this clip.
     run_ffmpeg_with_progress(&args, Some(duration_sec), ass_dir.as_deref(), on_progress)
+}
+
+/// Rewrite plan segments into the `-ss`-relative timeline used by the filters.
+fn relative_segments(request: &ClipRenderRequest<'_>) -> Vec<RenderSegment> {
+    let window = (request.end_sec - request.start_sec).max(0.1);
+    request
+        .segments
+        .iter()
+        .map(|segment| RenderSegment {
+            start: (segment.start - request.start_sec).clamp(0.0, window),
+            end: (segment.end - request.start_sec).clamp(0.0, window),
+            speed: segment.speed.clamp(0.5, 4.0),
+            zoom: segment.zoom.clamp(1.0, 1.4),
+        })
+        .filter(|segment| segment.end - segment.start > 0.01)
+        .collect()
+}
+
+/// Build the `-filter_complex` graph that replays an auto-edit cut list.
+///
+/// Every kept span becomes a `trim`/`atrim` pair (plus `setpts`/`atempo` when
+/// retimed), all spans are concatenated, and the crop/caption chain runs once on
+/// the joined result so the framing stays identical across cuts. Punch-in zoom
+/// is the exception: it must be baked per segment, before the concat.
+fn auto_edit_filter_graph(
+    request: &ClipRenderRequest<'_>,
+    segments: &[RenderSegment],
+    ass_filter: Option<&str>,
+    filter_suffix: &str,
+) -> String {
+    let count = segments.len();
+    let punch_per_segment = request.has_video && segments.iter().any(|segment| segment.zoom > 1.0 + 1e-9);
+    let mut chains: Vec<String> = Vec::new();
+    let mut concat_inputs = String::new();
+
+    for (index, segment) in segments.iter().enumerate() {
+        let start = format!("{:.3}", segment.start);
+        let end = format!("{:.3}", segment.end);
+        let speed = segment.speed.max(0.5);
+
+        if request.has_video {
+            let mut chain = format!(
+                "[0:v]trim=start={start}:end={end},setpts=(PTS-STARTPTS)/{speed:.4}"
+            );
+            if punch_per_segment {
+                chain.push(',');
+                chain.push_str(&crop_and_scale_filter(
+                    request.aspect_ratio,
+                    request.crop_x,
+                    request.crop_y,
+                ));
+                if segment.zoom > 1.0 + 1e-9 {
+                    let (width, height) = clip_dimensions(request.aspect_ratio);
+                    chain.push_str(&format!(
+                        ",scale=iw*{:.4}:ih*{:.4}:flags=fast_bilinear,crop={width}:{height}",
+                        segment.zoom, segment.zoom
+                    ));
+                }
+            }
+            chain.push_str(&format!("[v{index}]"));
+            chains.push(chain);
+            concat_inputs.push_str(&format!("[v{index}]"));
+        }
+
+        if request.has_audio {
+            let mut chain = format!("[0:a]atrim=start={start}:end={end},asetpts=PTS-STARTPTS");
+            if (speed - 1.0).abs() > 1e-3 {
+                chain.push_str(&format!(",atempo={speed:.4}"));
+            }
+            chain.push_str(&format!("[a{index}]"));
+            chains.push(chain);
+            concat_inputs.push_str(&format!("[a{index}]"));
+        }
+    }
+
+    if chains.is_empty() {
+        return String::new();
+    }
+
+    let mut graph = chains.join(";");
+    graph.push(';');
+    match (request.has_video, request.has_audio) {
+        (true, true) => graph.push_str(&format!(
+            "{concat_inputs}concat=n={count}:v=1:a=1[cv][ca]"
+        )),
+        (true, false) => graph.push_str(&format!(
+            "{concat_inputs}concat=n={count}:v=1:a=0[cv]"
+        )),
+        (false, true) => graph.push_str(&format!(
+            "{concat_inputs}concat=n={count}:v=0:a=1[ca]"
+        )),
+        (false, false) => return String::new(),
+    }
+
+    if request.has_video {
+        let mut filters: Vec<String> = Vec::new();
+        if !punch_per_segment {
+            filters.push(crop_and_scale_filter(
+                request.aspect_ratio,
+                request.crop_x,
+                request.crop_y,
+            ));
+        }
+        if let Some(filter) = ass_filter {
+            filters.push(filter.to_string());
+        }
+        let suffix = filter_suffix.trim_start_matches(',');
+        if !suffix.is_empty() {
+            filters.push(suffix.to_string());
+        }
+        if filters.is_empty() {
+            graph.push_str(";[cv]null[vout]");
+        } else {
+            graph.push_str(&format!(";[cv]{}[vout]", filters.join(",")));
+        }
+    }
+
+    graph
 }
 
 #[cfg(test)]

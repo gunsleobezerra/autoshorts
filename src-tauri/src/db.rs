@@ -111,6 +111,8 @@ impl Database {
         let _ = conn.execute("ALTER TABLE projects ADD COLUMN caption_style TEXT", []);
         // Fine-grained caption look (colour, font, position) edited per clip.
         let _ = conn.execute("ALTER TABLE clip_edits ADD COLUMN caption_override_json TEXT", []);
+        // Automatic tight-cut settings (silence removal + pacing).
+        let _ = conn.execute("ALTER TABLE clip_edits ADD COLUMN auto_edit_json TEXT", []);
         // No ffmpeg process survives an app restart, so any clip still marked
         // `cutting` was interrupted. Reset it instead of showing a render that
         // can never finish.
@@ -497,7 +499,7 @@ impl Database {
         let edit = conn
             .query_row(
                 "SELECT candidate_id, aspect_ratio, crop_x, crop_y, captions_json, caption_style,
-                        caption_override_json
+                        caption_override_json, auto_edit_json
                  FROM clip_edits WHERE candidate_id = ?1",
                 params![candidate_id],
                 clip_edit_from_row,
@@ -514,13 +516,17 @@ impl Database {
             Some(value) => Some(serde_json::to_string(value)?),
             None => None,
         };
+        let auto_edit_json = match stored.auto_edit.as_ref() {
+            Some(value) => Some(serde_json::to_string(value)?),
+            None => None,
+        };
         let now = Utc::now().to_rfc3339();
         let conn = self.conn.lock().expect("database mutex poisoned");
         conn.execute(
             "INSERT INTO clip_edits
                 (candidate_id, aspect_ratio, crop_x, crop_y, captions_json, caption_style,
-                 caption_override_json, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 caption_override_json, auto_edit_json, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT(candidate_id) DO UPDATE SET
                 aspect_ratio = excluded.aspect_ratio,
                 crop_x = excluded.crop_x,
@@ -528,6 +534,7 @@ impl Database {
                 captions_json = excluded.captions_json,
                 caption_style = excluded.caption_style,
                 caption_override_json = excluded.caption_override_json,
+                auto_edit_json = excluded.auto_edit_json,
                 updated_at = excluded.updated_at",
             params![
                 stored.candidate_id,
@@ -537,6 +544,7 @@ impl Database {
                 captions_json,
                 stored.caption_style,
                 override_json,
+                auto_edit_json,
                 now
             ],
         )?;
@@ -549,7 +557,7 @@ impl Database {
         let mut stmt = conn.prepare(
             "SELECT clip_edits.candidate_id, clip_edits.aspect_ratio, clip_edits.crop_x,
                     clip_edits.crop_y, clip_edits.captions_json, clip_edits.caption_style,
-                    clip_edits.caption_override_json
+                    clip_edits.caption_override_json, clip_edits.auto_edit_json
              FROM clip_edits
              INNER JOIN candidates ON candidates.id = clip_edits.candidate_id
              WHERE candidates.project_id = ?1
@@ -594,6 +602,7 @@ fn project_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
 fn clip_edit_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ClipEdit> {
     let captions_json: String = row.get(4)?;
     let override_json: Option<String> = row.get(6)?;
+    let auto_edit_json: Option<String> = row.get(7)?;
     Ok(ClipEdit {
         candidate_id: row.get(0)?,
         aspect_ratio: row.get(1)?,
@@ -602,6 +611,7 @@ fn clip_edit_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ClipEdit> {
         captions: serde_json::from_str(&captions_json).unwrap_or_default(),
         caption_style: row.get(5)?,
         caption_override: override_json.and_then(|json| serde_json::from_str(&json).ok()),
+        auto_edit: auto_edit_json.and_then(|json| serde_json::from_str(&json).ok()),
     })
 }
 

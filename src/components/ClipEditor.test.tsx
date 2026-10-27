@@ -443,3 +443,64 @@ describe("ClipEditor", () => {
     expect(alert).toHaveTextContent("pré-visualização");
   });
 });
+
+describe("ClipEditor auto-edit", () => {
+  it("saves null when auto-edit stays off", async () => {
+    const { onSaved } = renderEditor();
+    await screen.findByTestId("clip-editor-video");
+
+    fireEvent.click(screen.getByRole("button", { name: /^Save$/ }));
+
+    await waitFor(() => expect(onSaved).toHaveBeenCalled());
+    const [, args] = invokeMock.mock.calls.find(([command]) => command === "save_clip_edit")!;
+    expect((args as { edit: { autoEdit: unknown } }).edit.autoEdit).toBeNull();
+  });
+
+  it("sends sanitized settings once the toggle is enabled", async () => {
+    const { onSaved } = renderEditor();
+    await screen.findByTestId("clip-editor-video");
+
+    fireEvent.click(screen.getByLabelText("Ativar auto-edit"));
+    await screen.findByText(/pausas cortadas/);
+
+    fireEvent.click(screen.getByRole("button", { name: /^Save$/ }));
+
+    await waitFor(() => expect(onSaved).toHaveBeenCalled());
+    const [, args] = invokeMock.mock.calls.find(([command]) => command === "save_clip_edit")!;
+    const autoEdit = (args as { edit: { autoEdit: Record<string, unknown> } }).edit.autoEdit;
+    expect(autoEdit).toMatchObject({
+      enabled: true,
+      silenceMode: "cut",
+      silenceThresholdDb: -32,
+      minSilenceSec: 0.45,
+    });
+  });
+
+  it("restores saved settings from the backend payload", async () => {
+    renderEditor(
+      buildPayload({
+        edit: {
+          candidateId: "cand-1",
+          aspectRatio: "9:16",
+          cropX: 0.5,
+          cropY: 0.5,
+          captions: [],
+          captionStyle: null,
+          autoEdit: {
+            enabled: true,
+            silenceThresholdDb: -40,
+            minSilenceSec: 0.6,
+            paddingSec: 0.1,
+            silenceMode: "speed",
+            silenceSpeed: 2.5,
+            punchInZoom: 1.12,
+          },
+        },
+      }),
+    );
+
+    const toggle = (await screen.findByLabelText("Ativar auto-edit")) as HTMLInputElement;
+    expect(toggle.checked).toBe(true);
+    expect(screen.getByText(/pausas em 2.5x/)).toBeTruthy();
+  });
+});

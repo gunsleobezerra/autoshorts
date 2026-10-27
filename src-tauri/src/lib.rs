@@ -1,3 +1,4 @@
+pub mod autoedit;
 pub mod db;
 pub mod hardware;
 pub mod llm;
@@ -1013,8 +1014,11 @@ async fn render_flat_clip_for_candidate(
         let mut caption_ass_path: Option<std::path::PathBuf> = None;
 
         // Probe once and reuse the result for the whole render.
-        let has_video = media::probe_media(&project.source_path)
-            .map(|probe| probe.has_video)
+        let probe = media::probe_media(&project.source_path).ok();
+        let has_video = probe.as_ref().map(|probe| probe.has_video).unwrap_or(true);
+        let has_audio = probe
+            .as_ref()
+            .map(|probe| probe.audio_codec.is_some())
             .unwrap_or(true);
 
         let caption_style = edit
@@ -1025,45 +1029,80 @@ async fn render_flat_clip_for_candidate(
         let project_data_dir = data_dir.join("projects").join(&project.id);
         let _ = std::fs::create_dir_all(&project_data_dir);
 
+        // The transcript feeds both the caption text and the auto-edit speech
+        // map, so parse it once.
+        let normalized = db
+            .latest_transcript(&project.id)
+            .ok()
+            .flatten()
+            .and_then(|record| serde_json::from_str::<NormalizedTranscript>(&record.raw_json).ok());
+
+        // Auto-edit is opt-in per clip. A failure (missing ffmpeg, unreadable
+        // source) degrades to the normal render instead of losing the clip.
+        let auto_edit_plan = edit
+            .auto_edit
+            .clone()
+            .filter(|settings| settings.enabled)
+            .and_then(|settings| {
+                let words = normalized
+                    .as_ref()
+                    .map(|transcript| transcript.words.as_slice())
+                    .unwrap_or(&[]);
+                match autoedit::build_plan(
+                    &project.source_path,
+                    candidate.start_sec,
+                    candidate.end_sec,
+                    &settings,
+                    words,
+                ) {
+                    Ok(plan) if !plan.is_noop() => Some(plan),
+                    Ok(_) => None,
+                    Err(error) => {
+                        eprintln!("[autoshorts] auto-edit skipped: {error}");
+                        None
+                    }
+                }
+            });
+
         // Captions authored in the editor win; otherwise derive them from the
-        // latest transcript exactly like before.
-        let ass_content = if !edit.captions.is_empty() {
+        // latest transcript exactly like before. With auto-edit the cues are
+        // rewritten onto the compressed timeline and the ASS window becomes
+        // `0..output_duration`.
+        let mut cues: Vec<CaptionCue> = if !edit.captions.is_empty() {
+            edit.captions.clone()
+        } else {
+            normalized
+                .as_ref()
+                .map(|transcript| {
+                    cues_from_words(&transcript.words, candidate.start_sec, candidate.end_sec)
+                })
+                .unwrap_or_default()
+        };
+        let (caption_start, caption_end) = match auto_edit_plan.as_ref() {
+            Some(plan) => {
+                cues = autoedit::remap_cues(&cues, plan);
+                (0.0, plan.output_duration)
+            }
+            None => (candidate.start_sec, candidate.end_sec),
+        };
+
+        let ass_content = if cues.is_empty() {
+            None
+        } else {
+            // Plain-text sidecar kept for the UI / upload metadata.
+            let srt_content = generate_srt_from_cues(&cues, caption_start, caption_end);
+            let clip_srt_path = project_data_dir.join(format!("clip-{}.srt", candidate.id));
+            let _ = std::fs::write(&clip_srt_path, srt_content);
+
+            // One ASS file replaces the previous drawtext chain: ffmpeg
+            // evaluates a single `ass` filter per frame.
             Some(build_ass_captions_from_cues(
-                &edit.captions,
-                candidate.start_sec,
-                candidate.end_sec,
+                &cues,
+                caption_start,
+                caption_end,
                 &caption_style,
                 edit.caption_override.as_ref(),
             ))
-        } else {
-            match db.latest_transcript(&project.id) {
-                Ok(Some(transcript_record)) => {
-                    serde_json::from_str::<NormalizedTranscript>(&transcript_record.raw_json)
-                        .ok()
-                        .map(|normalized| {
-                            // Plain-text sidecar kept for the UI / upload metadata.
-                            let srt_content = generate_srt(
-                                &normalized.words,
-                                candidate.start_sec,
-                                candidate.end_sec,
-                            );
-                            let clip_srt_path =
-                                project_data_dir.join(format!("clip-{}.srt", candidate.id));
-                            let _ = std::fs::write(&clip_srt_path, srt_content);
-
-                            // One ASS file replaces the previous drawtext chain:
-                            // ffmpeg evaluates a single `ass` filter per frame.
-                            build_ass_captions(
-                                &normalized.words,
-                                candidate.start_sec,
-                                candidate.end_sec,
-                                &caption_style,
-                                edit.caption_override.as_ref(),
-                            )
-                        })
-                }
-                _ => None,
-            }
         };
 
         if let Some(ass_content) = ass_content {
@@ -1074,16 +1113,23 @@ async fn render_flat_clip_for_candidate(
             }
         }
 
+        let segments: &[autoedit::RenderSegment] = auto_edit_plan
+            .as_ref()
+            .map(|plan| plan.segments.as_slice())
+            .unwrap_or(&[]);
+
         let request = media::ClipRenderRequest {
             source_path: &project.source_path,
             start_sec: candidate.start_sec,
             end_sec: candidate.end_sec,
             output_path: &output_path,
             has_video,
+            has_audio,
             ass_path: caption_ass_path.as_deref(),
             aspect_ratio: &edit.aspect_ratio,
             crop_x: edit.crop_x,
             crop_y: edit.crop_y,
+            segments,
         };
 
         match media::render_flat_clip(&request, |percentage| {
@@ -1431,6 +1477,7 @@ fn to_command_error(error: impl Into<anyhow::Error>) -> String {
     message
 }
 
+#[cfg(test)]
 fn generate_srt(words: &[TranscriptWord], start_sec: f64, end_sec: f64) -> String {
     let mut srt = String::new();
     let mut index = 1;
@@ -1462,6 +1509,28 @@ fn generate_srt(words: &[TranscriptWord], start_sec: f64, end_sec: f64) -> Strin
             format_srt_time(start_rel, end_rel)
         ));
         srt.push_str(&format!("{text}\n\n"));
+        index += 1;
+    }
+
+    srt
+}
+
+/// Serialize already-chunked cues as SRT, rebased onto `start_sec`. Cues are
+/// absolute before the auto-edit remap and 0-based after it, so both paths run
+/// through this helper.
+fn generate_srt_from_cues(cues: &[CaptionCue], start_sec: f64, end_sec: f64) -> String {
+    let mut srt = String::new();
+    let mut index = 1;
+
+    for cue in cues {
+        let start_rel = (cue.start - start_sec).max(0.0);
+        let end_rel = (cue.end - start_sec).min(end_sec - start_sec).max(0.0);
+        if end_rel <= start_rel {
+            continue;
+        }
+        srt.push_str(&format!("{index}\n"));
+        srt.push_str(&format!("{}\n", format_srt_time(start_rel, end_rel)));
+        srt.push_str(&format!("{}\n\n", cue.text.trim()));
         index += 1;
     }
 
@@ -1656,6 +1725,7 @@ fn ass_escape_text(text: &str) -> String {
 /// Replaces the previous "one drawtext filter per word pair" approach: ffmpeg
 /// now evaluates a single `ass` filter per frame, which is several times faster
 /// on long clips.
+#[cfg(test)]
 fn build_ass_captions(
     words: &[TranscriptWord],
     start_sec: f64,

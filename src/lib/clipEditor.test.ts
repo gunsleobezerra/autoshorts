@@ -3,13 +3,16 @@ import {
   ASPECT_PRESETS,
   CAPTION_STYLES,
   DEFAULT_ASPECT_RATIO,
+  DEFAULT_AUTO_EDIT,
   aspectValue,
+  autoEditSummary,
   canPlayDirectly,
   captionPreviewStyle,
   clampCues,
   hexToRgba,
   isLinuxWebview,
   needsProxyFor,
+  normalizeAutoEdit,
   resolveCaptionStyle,
   sanitizeHex,
   cropGeometry,
@@ -360,5 +363,75 @@ describe("captionPreviewStyle", () => {
     expect(outlined.top).toBe("50%");
     expect(outlined.background).toBe("transparent");
     expect(outlined.WebkitTextStroke).toContain("px");
+  });
+});
+
+describe("normalizeAutoEdit", () => {
+  it("keeps null as null so untouched clips stay untouched", () => {
+    expect(normalizeAutoEdit(null)).toBeNull();
+    expect(normalizeAutoEdit(undefined)).toBeNull();
+  });
+
+  it("clamps every value into the range the backend accepts", () => {
+    const normalized = normalizeAutoEdit({
+      enabled: true,
+      silenceThresholdDb: -120,
+      minSilenceSec: 99,
+      paddingSec: -1,
+      silenceMode: "speed" as const,
+      silenceSpeed: 0.2,
+      punchInZoom: 5,
+    });
+    expect(normalized).not.toBeNull();
+    expect(normalized?.silenceThresholdDb).toBe(-60);
+    expect(normalized?.minSilenceSec).toBe(5);
+    expect(normalized?.paddingSec).toBe(0);
+    expect(normalized?.silenceSpeed).toBe(1.1);
+    expect(normalized?.punchInZoom).toBe(1.4);
+  });
+
+  it("falls back to cut for unknown silence modes", () => {
+    const normalized = normalizeAutoEdit({
+      ...DEFAULT_AUTO_EDIT,
+      silenceMode: "explode" as unknown as "cut",
+    });
+    expect(normalized?.silenceMode).toBe("cut");
+  });
+
+  it("replaces non-finite numbers with the defaults", () => {
+    const normalized = normalizeAutoEdit({
+      ...DEFAULT_AUTO_EDIT,
+      minSilenceSec: Number.NaN,
+    });
+    expect(normalized?.minSilenceSec).toBe(DEFAULT_AUTO_EDIT.minSilenceSec);
+  });
+});
+
+describe("autoEditSummary", () => {
+  it("reports the disabled state", () => {
+    expect(autoEditSummary(null)).toBe("Auto-edit desligado");
+    expect(autoEditSummary({ ...DEFAULT_AUTO_EDIT, enabled: false })).toBe(
+      "Auto-edit desligado",
+    );
+  });
+
+  it("describes a cut plan with the threshold and minimum pause", () => {
+    const summary = autoEditSummary({ ...DEFAULT_AUTO_EDIT, enabled: true });
+    expect(summary).toContain("pausas cortadas");
+    expect(summary).toContain("-32 dB");
+    expect(summary).toContain("0.45s");
+    expect(summary).not.toContain("zoom dinâmico");
+  });
+
+  it("describes a speed plan and mentions punch-in when enabled", () => {
+    const summary = autoEditSummary({
+      ...DEFAULT_AUTO_EDIT,
+      enabled: true,
+      silenceMode: "speed",
+      silenceSpeed: 2,
+      punchInZoom: 1.15,
+    });
+    expect(summary).toContain("2x");
+    expect(summary).toContain("zoom dinâmico");
   });
 });
