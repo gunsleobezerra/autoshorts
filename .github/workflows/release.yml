@@ -54,7 +54,7 @@ jobs:
   release:
     # Only real version tags cut a release. On a push to `main` `github.ref_name`
     # is literally "main", which used to create a bogus `main` tag/release.
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push'
     needs: test
     permissions:
       contents: write
@@ -108,108 +108,4 @@ jobs:
           releaseDraft: true
           prerelease: false
 
-  android:
-    needs: test
-    if: 
-      github.event_name == 'push'
-    permissions:
-      contents: write
-    runs-on: ubuntu-22.04
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Install Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
-
-      - name: Install Linux dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
-
-      - name: Install JDK
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: 17
-
-      - name: Install Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install Android NDK
-        run: |
-          sdkmanager --install "ndk;27.0.12077973"
-          echo "NDK_HOME=$ANDROID_SDK_ROOT/ndk/27.0.12077973" >> "$GITHUB_ENV"
-
-      - name: Install node modules
-        run: npm ci
-
-      - name: Init Android project
-        run: npx tauri android init --ci
-
-      - name: Build Android bundles
-        run: npx tauri android build --apk --aab
-
-      - name: Collect artifacts
-        run: |
-          mkdir -p artifacts/android
-          find src-tauri/gen/android/app/build/outputs -type f \
-            \( -name '*.apk' -o -name '*.aab' \) -exec cp {} artifacts/android/ \;
-          ls -lh artifacts/android
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: android-bundles
-          path: artifacts/android/*
-
-  ios:
-    needs: test
-    if: 
-      github.event_name == 'push'
-    permissions:
-      contents: write
-    runs-on: macos-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Install Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-apple-ios,x86_64-apple-ios,aarch64-apple-ios-sim
-
-      - name: Install node modules
-        run: npm ci
-
-      - name: Init iOS project
-        run: npx tauri ios init --ci
-
-      - name: Build iOS app (unsigned)
-        run: npx tauri ios build --no-sign
-
-      - name: Collect artifacts
-        run: |
-          mkdir -p artifacts/ios
-          find src-tauri/gen/apple/build -maxdepth 4 -name '*.app' -type d -exec cp -R {} artifacts/ios/ \;
-          find src-tauri/gen/apple/build -maxdepth 4 -name '*.ipa' -type f -exec cp {} artifacts/ios/ \;
-          ls -lhR artifacts/ios || true
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: ios-app
-          path: artifacts/ios/**
-
+ 
