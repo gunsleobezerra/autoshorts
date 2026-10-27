@@ -202,7 +202,208 @@ pub fn extract_audio(
     Ok(output_path)
 }
 
-/// Options for rendering a single vertical clip.
+/// Aspect ratio used when the caller does not specify one.
+pub const DEFAULT_ASPECT_RATIO: &str = "9:16";
+
+/// Canonicalize a user-supplied aspect ratio into one of the four supported
+/// values, falling back to vertical video.
+pub fn normalize_aspect_ratio(value: &str) -> &'static str {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1:1" | "1x1" | "square" => "1:1",
+        "16:9" => "16:9",
+        "4:5" => "4:5",
+        _ => DEFAULT_ASPECT_RATIO,
+    }
+}
+
+/// Output resolution for a clip. Normalizing here keeps the encoder from
+/// working on 4K frames when the source is larger than a phone screen.
+pub fn clip_dimensions(aspect_ratio: &str) -> (i64, i64) {
+    match normalize_aspect_ratio(aspect_ratio) {
+        "1:1" => (1080, 1080),
+        "16:9" => (1920, 1080),
+        "4:5" => (1080, 1350),
+        _ => (1080, 1920),
+    }
+}
+
+fn clamp_crop(value: f64) -> f64 {
+    if value.is_finite() {
+        value.clamp(0.0, 1.0)
+    } else {
+        0.5
+    }
+}
+
+/// Build the crop + scale portion of the ffmpeg filter chain.
+///
+/// The crop window keeps the requested aspect ratio inside the source frame
+/// and slides inside the remaining slack according to `crop_x`/`crop_y`
+/// (0.0 = left/top, 0.5 = centered, 1.0 = right/bottom). Single-quoted
+/// expressions protect the commas from ffmpeg's filter parser.
+pub fn crop_and_scale_filter(aspect_ratio: &str, crop_x: f64, crop_y: f64) -> String {
+    let ratio = normalize_aspect_ratio(aspect_ratio);
+    let a = match ratio {
+        "1:1" => 1.0,
+        "16:9" => 16.0 / 9.0,
+        "4:5" => 4.0 / 5.0,
+        _ => 9.0 / 16.0,
+    };
+    let crop_x = clamp_crop(crop_x);
+    let crop_y = clamp_crop(crop_y);
+    let (width, height) = clip_dimensions(ratio);
+    format!(
+        "crop=w='2*trunc(min(iw,ih*{a})/2)':h='2*trunc(min(ih,iw/{a})/2)':\
+         x='(iw-ow)*{crop_x}':y='(ih-oh)*{crop_y}',\
+         scale={width}:{height}:flags=fast_bilinear"
+    )
+}
+
+/// Height cap for the editor preview proxy. Small enough to encode the whole
+/// source in roughly a minute, large enough to judge the crop.
+pub const PREVIEW_HEIGHT: i64 = 480;
+
+/// Downscale filter for the preview proxy, preserving aspect ratio and
+/// keeping both dimensions even (required by VP8).
+fn preview_scale_filter() -> String {
+    format!(
+        "scale=w='min(854,iw)':h='min({PREVIEW_HEIGHT},ih)':\
+         force_original_aspect_ratio=decrease:force_divisible_by=2:\
+         flags=fast_bilinear"
+    )
+}
+
+/// ffmpeg arguments that transcode the whole source into a WebM proxy.
+///
+/// WebKitGTK can only decode what the installed GStreamer plugins provide, and
+/// a stock Ubuntu install ships no H.264/AAC decoders, so a source MP4 simply
+/// does not play inside the webview. A VP8/Opus WebM proxy does play with the
+/// `vpx`, `matroska` and `opus` plugins that are present everywhere.
+///
+/// The proxy covers the entire media instead of a single clip window so one
+/// encode serves every candidate of a project and the editor can seek freely.
+/// Settings trade quality for speed: `deadline realtime` with `cpu-used 16`
+/// encodes around 8x realtime on a laptop CPU.
+pub fn preview_proxy_args(source_path: &str, output_path: &Path) -> Vec<String> {
+    vec![
+        "-y".into(),
+        "-i".into(),
+        source_path.to_string(),
+        "-map".into(),
+        "0:v:0".into(),
+        "-map".into(),
+        "0:a:0?".into(),
+        "-vf".into(),
+        preview_scale_filter(),
+        "-r".into(),
+        "20".into(),
+        "-c:v".into(),
+        "libvpx".into(),
+        "-b:v".into(),
+        "550k".into(),
+        "-deadline".into(),
+        "realtime".into(),
+        "-cpu-used".into(),
+        "16".into(),
+        "-row-mt".into(),
+        "1".into(),
+        "-threads".into(),
+        "4".into(),
+        "-g".into(),
+        "40".into(),
+        "-c:a".into(),
+        "libopus".into(),
+        "-b:a".into(),
+        "48k".into(),
+        "-ac".into(),
+        "1".into(),
+        "-f".into(),
+        "webm".into(),
+        output_path.to_string_lossy().to_string(),
+    ]
+}
+
+/// Transcode the whole source into a WebM preview proxy, reporting 0..=100
+/// progress against `duration_sec`.
+pub fn render_preview_proxy(
+    source_path: &str,
+    output_path: &Path,
+    duration_sec: Option<f64>,
+    mut on_progress: impl FnMut(f64),
+) -> Result<PathBuf> {
+    if !command_exists("ffmpeg") {
+        return Err(anyhow!("ffmpeg is not installed or not available on PATH"));
+    }
+
+    let output_path = absolute_path(output_path);
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let duration = duration_sec.filter(|value| value.is_finite() && *value > 0.0);
+    let args = preview_proxy_args(source_path, &output_path);
+    run_ffmpeg_with_progress(&args, duration, None, &mut on_progress)?;
+    Ok(output_path)
+}
+
+/// Width cap for candidate thumbnails in the clip list.
+pub const THUMB_WIDTH: i64 = 360;
+
+/// ffmpeg arguments that grab one frame as a small JPEG thumbnail.
+///
+/// `-ss` sits before `-i` so ffmpeg seeks by index instead of decoding from
+/// the start; on a 12 minute source that turns a 4 second job into ~60 ms.
+pub fn thumbnail_args(source_path: &str, time_sec: f64, output_path: &Path) -> Vec<String> {
+    let timestamp = if time_sec.is_finite() && time_sec > 0.0 {
+        time_sec
+    } else {
+        0.0
+    };
+    vec![
+        "-y".into(),
+        "-ss".into(),
+        format!("{timestamp:.3}"),
+        "-i".into(),
+        source_path.to_string(),
+        "-frames:v".into(),
+        "1".into(),
+        "-vf".into(),
+        format!("scale=w='min({THUMB_WIDTH},iw)':h=-2:flags=fast_bilinear"),
+        "-q:v".into(),
+        "5".into(),
+        "-an".into(),
+        "-f".into(),
+        "image2".into(),
+        output_path.to_string_lossy().to_string(),
+    ]
+}
+
+/// Render a single JPEG frame at `time_sec`, returning the written path.
+pub fn render_thumbnail(source_path: &str, time_sec: f64, output_path: &Path) -> Result<PathBuf> {
+    if !command_exists("ffmpeg") {
+        return Err(anyhow!("ffmpeg is not installed or not available on PATH"));
+    }
+
+    let output_path = absolute_path(output_path);
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let args = thumbnail_args(source_path, time_sec, &output_path);
+    let output = Command::new("ffmpeg")
+        .args(&args)
+        .output()
+        .context("running ffmpeg for a thumbnail")?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "ffmpeg failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(output_path)
+}
+
+/// Options for rendering a single clip.
 pub struct ClipRenderRequest<'a> {
     pub source_path: &'a str,
     pub start_sec: f64,
@@ -212,12 +413,13 @@ pub struct ClipRenderRequest<'a> {
     pub has_video: bool,
     /// Optional ASS subtitle file burned into the video.
     pub ass_path: Option<&'a Path>,
+    /// Target aspect ratio; see [`normalize_aspect_ratio`].
+    pub aspect_ratio: &'a str,
+    /// Horizontal crop position inside the slack, 0.0..=1.0.
+    pub crop_x: f64,
+    /// Vertical crop position inside the slack, 0.0..=1.0.
+    pub crop_y: f64,
 }
-
-/// Output resolution for every clip. Normalizing here keeps the encoder from
-/// working on 4K frames when the source is larger than a phone screen.
-const CLIP_WIDTH: i64 = 1080;
-const CLIP_HEIGHT: i64 = 1920;
 
 fn absolute_path(path: &Path) -> PathBuf {
     if path.is_absolute() {
@@ -325,10 +527,11 @@ fn run_clip_ffmpeg(
     let mut ass_dir: Option<PathBuf> = None;
 
     if request.has_video {
-        let mut filters = vec![
-            "crop=w='2*trunc(min(iw,ih*9/16)/2)':h='2*trunc(min(ih,iw*16/9)/2)'".to_string(),
-            format!("scale={CLIP_WIDTH}:{CLIP_HEIGHT}:flags=fast_bilinear"),
-        ];
+        let mut filters = vec![crop_and_scale_filter(
+            request.aspect_ratio,
+            request.crop_x,
+            request.crop_y,
+        )];
 
         if let Some(ass_path) = request.ass_path {
             let ass_path = absolute_path(ass_path);
@@ -419,6 +622,72 @@ mod tests {
     #[test]
     fn absolute_path_resolves_relative_paths() {
         assert!(absolute_path(Path::new("clip.mp4")).is_absolute());
+    }
+
+    #[test]
+    fn clip_dimensions_match_aspect_ratio_table() {
+        assert_eq!(clip_dimensions("9:16"), (1080, 1920));
+        assert_eq!(clip_dimensions("1:1"), (1080, 1080));
+        assert_eq!(clip_dimensions("16:9"), (1920, 1080));
+        assert_eq!(clip_dimensions("4:5"), (1080, 1350));
+        assert_eq!(clip_dimensions("unknown"), (1080, 1920));
+    }
+
+    #[test]
+    fn normalize_aspect_ratio_accepts_aliases_and_falls_back() {
+        assert_eq!(normalize_aspect_ratio("1:1"), "1:1");
+        assert_eq!(normalize_aspect_ratio("1x1"), "1:1");
+        assert_eq!(normalize_aspect_ratio("Square"), "1:1");
+        assert_eq!(normalize_aspect_ratio(" 16:9 "), "16:9");
+        assert_eq!(normalize_aspect_ratio("4:5"), "4:5");
+        assert_eq!(normalize_aspect_ratio(""), DEFAULT_ASPECT_RATIO);
+        assert_eq!(normalize_aspect_ratio("3:2"), DEFAULT_ASPECT_RATIO);
+    }
+
+    #[test]
+    fn crop_and_scale_filter_builds_landscape_chain() {
+        let filter = crop_and_scale_filter("16:9", 0.0, 1.0);
+        assert!(filter.starts_with("crop=w='2*trunc(min(iw,ih*"), "{filter}");
+        assert!(filter.contains("x='(iw-ow)*0'"), "{filter}");
+        assert!(filter.contains("y='(ih-oh)*1'"), "{filter}");
+        assert!(filter.contains("scale=1920:1080:flags=fast_bilinear"), "{filter}");
+    }
+
+    #[test]
+    fn crop_and_scale_filter_clamps_positions() {
+        let filter = crop_and_scale_filter("9:16", -3.0, f64::NAN);
+        assert!(filter.contains("x='(iw-ow)*0'"), "{filter}");
+        assert!(filter.contains("y='(ih-oh)*0.5'"), "{filter}");
+        assert!(filter.contains("scale=1080:1920:flags=fast_bilinear"), "{filter}");
+    }
+
+    #[test]
+    fn preview_proxy_args_target_webm_vp8_opus() {
+        let args = preview_proxy_args("/media/source.mp4", Path::new("/tmp/preview.webm"));
+        let joined = args.join(" ");
+        // The proxy covers the whole media, so no trim flags are emitted.
+        assert!(!joined.contains("-ss "), "{joined}");
+        assert!(!joined.contains("-t "), "{joined}");
+        assert!(joined.contains("-map 0:a:0?"), "{joined}");
+        assert!(joined.contains("-c:v libvpx"), "{joined}");
+        assert!(joined.contains("-c:a libopus"), "{joined}");
+        assert!(joined.contains("-f webm"), "{joined}");
+        assert!(joined.contains("force_divisible_by=2"), "{joined}");
+        assert!(args.last().unwrap().ends_with("preview.webm"), "{joined}");
+    }
+
+    #[test]
+    fn thumbnail_args_seek_before_input_and_scale_down() {
+        let args = thumbnail_args("/media/source.mp4", 12.5, Path::new("/tmp/thumb.jpg"));
+        let joined = args.join(" ");
+        let seek = args.iter().position(|arg| arg == "-ss").unwrap();
+        let input = args.iter().position(|arg| arg == "-i").unwrap();
+        assert!(seek < input, "{joined}");
+        assert!(joined.contains("12.500"), "{joined}");
+        assert!(joined.contains("-frames:v 1"), "{joined}");
+        assert!(joined.contains("-an"), "{joined}");
+        assert!(joined.contains("min(360,iw)"), "{joined}");
+        assert!(args.last().unwrap().ends_with("thumb.jpg"), "{joined}");
     }
 
     #[test]

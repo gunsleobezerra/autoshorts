@@ -21,10 +21,14 @@ import {
   Copy,
   Database,
   Cloud,
+  Crop,
   Youtube,
   AlertTriangle,
 } from "lucide-react";
 import { EmptyState, PipelineStep } from "./components/common";
+import { ClipEditor } from "./components/ClipEditor";
+import type { CandidateThumbnail, ClipEdit } from "./lib/clipEditor";
+import { normalizeAspect } from "./lib/clipEditor";
 import { fileName, formatEncoderLabel, formatModelSize, formatTime } from "./lib/format";
 import "./styles.css";
 
@@ -97,6 +101,7 @@ type ProjectDetail = {
   transcript: Transcript | null;
   candidates: Candidate[];
   clips: Clip[];
+  clipEdits?: ClipEdit[];
 };
 
 type NormalizedTranscript = {
@@ -144,6 +149,9 @@ function App() {
   const [environment, setEnvironment] = useState<EnvironmentStatus | null>(null);
   const [projects, setProjects] = useState<Project[]>([]);
   const [detail, setDetail] = useState<ProjectDetail | null>(null);
+  // candidateId -> loopback thumbnail URL, rendered in the candidate cards.
+  const [thumbnails, setThumbnails] = useState<Record<string, string>>({});
+  const [thumbVersion, setThumbVersion] = useState(0);
   const [busy, setBusy] = useState<BusyState>("idle");
   const [error, setError] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
@@ -151,6 +159,7 @@ function App() {
   const [showStyleModal, setShowStyleModal] = useState(false);
   const [selectedStyle, setSelectedStyle] = useState("modern-box");
   const [mediaPathToImport, setMediaPathToImport] = useState<string | null>(null);
+  const [editingCandidateId, setEditingCandidateId] = useState<string | null>(null);
 
   const [youtubeModalOpen, setYoutubeModalOpen] = useState(false);
   const [youtubeUrl, setYoutubeUrl] = useState("");
@@ -283,6 +292,9 @@ function App() {
   const clipByCandidate = useMemo(() => {
     return new Map(detail?.clips.map((clip) => [clip.candidateId, clip]) ?? []);
   }, [detail?.clips]);
+  const clipEditByCandidate = useMemo(() => {
+    return new Map((detail?.clipEdits ?? []).map((edit) => [edit.candidateId, edit]));
+  }, [detail?.clipEdits]);
   const selectedCandidates = detail?.candidates.filter((candidate) => candidate.selected) ?? [];
   const selectedCutCount = selectedCandidates.filter((candidate) => {
     const clip = clipByCandidate.get(candidate.id);
@@ -401,6 +413,35 @@ function App() {
   useEffect(() => {
     void loadWhisperModels();
   }, []);
+
+  // Candidate thumbnails: extracted once per project (cached on disk) and
+  // re-extracted when a cut window changes.
+  useEffect(() => {
+    const projectId = detail?.project.id;
+    if (!projectId) {
+      setThumbnails({});
+      return;
+    }
+    let cancelled = false;
+    void (async () => {
+      try {
+        const list = await invoke<CandidateThumbnail[]>("prepare_project_thumbnails", {
+          projectId,
+        });
+        if (cancelled) return;
+        const next: Record<string, string> = {};
+        (Array.isArray(list) ? list : []).forEach((item) => {
+          if (item?.candidateId && item.url) next[item.candidateId] = item.url;
+        });
+        setThumbnails(next);
+      } catch {
+        /* thumbnails are a nicety, never block the view */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [detail?.project.id, detail?.candidates.length, thumbVersion]);
 
   const pullModelDirectly = async (modelName: string) => {
     setDownloadingModelName(modelName);
@@ -813,6 +854,44 @@ function App() {
       clearPipelineProgress("cut");
       await refresh(detail.project.id);
     }
+  }
+
+  function handleClipEditSaved(edit: ClipEdit) {
+    setDetail((current) => {
+      if (!current) return current;
+      const existing = current.clipEdits ?? [];
+      const hasEntry = existing.some((item) => item.candidateId === edit.candidateId);
+      const clipEdits = hasEntry
+        ? existing.map((item) => (item.candidateId === edit.candidateId ? edit : item))
+        : [...existing, edit];
+      return { ...current, clipEdits };
+    });
+  }
+
+  /** Merge a bulk style write (`apply_caption_style_to_project`). */
+  function handleBulkEditsSaved(edits: ClipEdit[]) {
+    if (!Array.isArray(edits) || edits.length === 0) return;
+    setDetail((current) => {
+      if (!current) return current;
+      const byId = new Map((current.clipEdits ?? []).map((item) => [item.candidateId, item]));
+      edits.forEach((edit) => byId.set(edit.candidateId, edit));
+      return { ...current, clipEdits: [...byId.values()] };
+    });
+  }
+
+  /** Keep the card in sync after the cut window was widened or shortened. */
+  function handleRangeChanged(updated: { id: string; startSec: number; endSec: number }) {
+    setDetail((current) => {
+      if (!current) return current;
+      const candidates = current.candidates.map((item) =>
+        item.id === updated.id
+          ? { ...item, startSec: updated.startSec, endSec: updated.endSec }
+          : item,
+      );
+      return { ...current, candidates };
+    });
+    // The backend drops the cached JPEG of the old window.
+    setThumbVersion((version) => version + 1);
   }
 
   async function cutSelected() {
@@ -1283,20 +1362,29 @@ function App() {
                     {detail.candidates.map((candidate) => {
                       const clip = clipByCandidate.get(candidate.id);
                       const isCut = clip?.status === "done" && Boolean(clip.outputPath);
+                      const clipEdit = clipEditByCandidate.get(candidate.id);
                       return (
                         <article key={candidate.id} className={`candidate-card ${candidate.selected ? "selected" : ""}`}>
-                          {/* 9:16 portrait mockup preview placeholder representing vertical formats */}
+                          {/* 9:16 portrait preview: thumbnail of the moment, cut badge on top */}
                           <div className="portrait-preview-container">
                             <div className="portrait-preview-mock">
+                              {thumbnails[candidate.id] ? (
+                                <img
+                                  className="mock-thumb"
+                                  src={thumbnails[candidate.id]}
+                                  alt=""
+                                  loading="lazy"
+                                />
+                              ) : null}
                               {isCut ? (
                                 <div className="mock-video-active">
                                   <Play size={20} className="play-icon-mock" />
                                 </div>
-                              ) : (
+                              ) : !thumbnails[candidate.id] ? (
                                 <div className="mock-video-inactive">
                                   <span>9:16</span>
                                 </div>
-                              )}
+                              ) : null}
                             </div>
                             <div className="candidate-rank">
                               <span>#{candidate.rank}</span>
@@ -1309,6 +1397,11 @@ function App() {
                               <span>{formatTime(candidate.startSec)} - {formatTime(candidate.endSec)}</span>
                               <span className="candidate-score">{Math.round(candidate.score * 100)}% Match</span>
                             </div>
+                            {clipEdit && (
+                              <span className="clip-edit-badge">
+                                {normalizeAspect(clipEdit.aspectRatio)} · {clipEdit.captionStyle ?? "modern-box"}
+                              </span>
+                            )}
                             <h4>{candidate.hook}</h4>
                             <p className="candidate-rationale">{candidate.rationale}</p>
 
@@ -1316,6 +1409,15 @@ function App() {
                               <span className={`clip-status ${isCut ? "ready" : clip?.status === "error" ? "error" : ""}`}>
                                 {isCut ? "Cut ready" : clip?.status === "error" ? "Cut failed" : clip?.status ?? "Pending"}
                               </span>
+                              <button
+                                className="edit-clip-button"
+                                onClick={() => setEditingCandidateId(candidate.id)}
+                                disabled={busy !== "idle"}
+                                title="Preview the cut, choose the crop and edit captions"
+                              >
+                                <Crop size={14} />
+                                Edit clip
+                              </button>
                               <button
                                 className="cut-button"
                                 onClick={() => void cutCandidate(candidate.id)}
@@ -1660,6 +1762,20 @@ function App() {
             </div>
           </div>
         </div>
+      )}
+
+      {editingCandidateId && (
+        <ClipEditor
+          candidateId={editingCandidateId}
+          onClose={() => setEditingCandidateId(null)}
+          onSaved={handleClipEditSaved}
+          onBulkSaved={handleBulkEditsSaved}
+          onRangeChanged={handleRangeChanged}
+          onRender={() => {
+            const candidateId = editingCandidateId;
+            if (candidateId) void cutCandidate(candidateId);
+          }}
+        />
       )}
     </div>
   );

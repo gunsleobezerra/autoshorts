@@ -9,7 +9,7 @@ use std::{
 };
 
 use autoshorts_lib::db::Database;
-use autoshorts_lib::models::CandidateDraft;
+use autoshorts_lib::models::{CandidateDraft, CaptionCue, CaptionStyleOverride, ClipEdit};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -361,4 +361,174 @@ fn opening_the_same_database_twice_reuses_the_schema() {
     let projects = db.list_projects().expect("listing projects");
     assert_eq!(projects.len(), 1);
     assert_eq!(projects[0].id, project_id);
+}
+
+#[test]
+fn clip_edits_round_trip_with_captions() {
+    let dir = TempDir::new("clip-edits");
+    let db = open_db(&dir);
+
+    let project = db
+        .create_project("/media/input.mp4", "local", "modern-box", None)
+        .expect("creating project");
+    let candidate = db
+        .replace_candidates(&project.id, &drafts(2))
+        .expect("replacing candidates")
+        .remove(0);
+
+    assert!(db.clip_edit(&candidate.id).expect("loading edit").is_none());
+
+    let edit = ClipEdit {
+        candidate_id: candidate.id.clone(),
+        aspect_ratio: "16:9".to_string(),
+        crop_x: 0.25,
+        crop_y: 0.75,
+        captions: vec![
+            CaptionCue {
+                start: 1.5,
+                end: 2.5,
+                text: "hello there".to_string(),
+            },
+            CaptionCue {
+                start: 3.0,
+                end: 4.0,
+                text: "second line".to_string(),
+            },
+        ],
+        caption_style: Some("classic-outline".to_string()),
+        caption_override: None,
+    };
+
+    let stored = db.save_clip_edit(&edit).expect("saving edit");
+    assert_eq!(stored, edit);
+
+    let loaded = db
+        .clip_edit(&candidate.id)
+        .expect("loading edit")
+        .expect("edit should exist");
+    assert_eq!(loaded, edit);
+    assert_eq!(loaded.captions.len(), 2);
+    assert_eq!(loaded.captions[0].text, "hello there");
+    assert_eq!(loaded.caption_style.as_deref(), Some("classic-outline"));
+
+    let detail = db.project_detail(&project.id).expect("loading detail");
+    assert_eq!(detail.clip_edits.len(), 1);
+    assert_eq!(detail.clip_edits[0], edit);
+
+    // Upsert replaces the same row instead of adding a second one.
+    let mut updated = edit.clone();
+    updated.aspect_ratio = "1:1".to_string();
+    updated.captions.clear();
+    db.save_clip_edit(&updated).expect("updating edit");
+    assert_eq!(table_count(&dir.db_path(), "clip_edits"), 1);
+
+    let loaded = db
+        .clip_edit(&candidate.id)
+        .expect("loading edit")
+        .expect("edit should exist");
+    assert_eq!(loaded.aspect_ratio, "1:1");
+    assert!(loaded.captions.is_empty());
+}
+
+#[test]
+fn save_clip_edit_sanitizes_out_of_range_values() {
+    let dir = TempDir::new("clip-edits-sanitize");
+    let db = open_db(&dir);
+
+    let project = db
+        .create_project("/media/input.mp4", "local", "modern-box", None)
+        .expect("creating project");
+    let candidate = db
+        .replace_candidates(&project.id, &drafts(1))
+        .expect("replacing candidates")
+        .remove(0);
+
+    let stored = db
+        .save_clip_edit(&ClipEdit {
+            candidate_id: candidate.id.clone(),
+            aspect_ratio: "square".to_string(),
+            crop_x: -5.0,
+            crop_y: 42.0,
+            captions: vec![CaptionCue {
+                start: 2.0,
+                end: 2.0,
+                text: "dropped".to_string(),
+            }],
+            caption_style: Some("   ".to_string()),
+            caption_override: None,
+        })
+        .expect("saving edit");
+
+    assert_eq!(stored.aspect_ratio, "1:1");
+    assert_eq!(stored.crop_x, 0.0);
+    assert_eq!(stored.crop_y, 1.0);
+    assert!(stored.captions.is_empty());
+    assert!(stored.caption_style.is_none());
+}
+
+#[test]
+fn caption_override_round_trips_and_sanitizes() {
+    let dir = TempDir::new("clip-edits-caption-override");
+    let db = open_db(&dir);
+
+    let project = db
+        .create_project("/media/input.mp4", "local", "modern-box", None)
+        .expect("creating project");
+    let candidate = db
+        .replace_candidates(&project.id, &drafts(1))
+        .expect("replacing candidates")
+        .remove(0);
+
+    let edit = ClipEdit {
+        candidate_id: candidate.id.clone(),
+        aspect_ratio: "9:16".to_string(),
+        crop_x: 0.5,
+        crop_y: 0.5,
+        captions: Vec::new(),
+        caption_style: Some("modern-box".to_string()),
+        caption_override: Some(CaptionStyleOverride {
+            font_family: Some("Inter".to_string()),
+            font_size: Some(140.0),
+            text_color: Some("#FFCC00".to_string()),
+            outline_color: Some("#000000".to_string()),
+            box_color: Some("#112233".to_string()),
+            border_style: Some(1),
+            outline: Some(3.0),
+            bold: Some(true),
+            uppercase: Some(false),
+            position: Some(0.25),
+            max_width: Some(0.8),
+        }),
+    };
+
+    let stored = db.save_clip_edit(&edit).expect("saving edit");
+    assert_eq!(stored, edit);
+
+    let loaded = db
+        .clip_edit(&candidate.id)
+        .expect("loading edit")
+        .expect("edit should exist");
+    assert_eq!(loaded.caption_override, edit.caption_override);
+
+    // Out-of-range values are clamped instead of rejected.
+    let clamped = db
+        .save_clip_edit(&ClipEdit {
+            caption_override: Some(CaptionStyleOverride {
+                font_size: Some(900.0),
+                text_color: Some("not-a-colour".to_string()),
+                position: Some(-2.0),
+                max_width: Some(5.0),
+                border_style: Some(7),
+                ..Default::default()
+            }),
+            ..edit
+        })
+        .expect("saving clamped edit");
+
+    let over = clamped.caption_override.expect("override kept");
+    assert_eq!(over.font_size, Some(200.0));
+    assert_eq!(over.text_color, None);
+    assert_eq!(over.position, Some(0.0));
+    assert_eq!(over.max_width, Some(1.0));
+    assert_eq!(over.border_style, Some(1));
 }
