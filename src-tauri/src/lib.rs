@@ -6,6 +6,7 @@ pub mod media_server;
 pub mod models;
 pub mod naming;
 pub mod progress;
+pub mod python_env;
 pub mod transcription;
 
 use std::collections::HashMap;
@@ -94,6 +95,25 @@ async fn environment_status(state: tauri::State<'_, AppState>) -> Result<Environ
         gpu_accel: hardware::active_video_encoder().is_hardware(),
         video_encoder: hardware::active_video_encoder().label().to_string(),
     })
+}
+
+#[tauri::command]
+fn python_env_status(state: tauri::State<'_, AppState>) -> python_env::PythonEnvStatus {
+    python_env::status(&state.data_dir)
+}
+
+/// Provisions the managed venv and installs `openai-whisper` into it. Blocking
+/// (pip + a ~1-2 GB PyTorch download), so it runs off the async runtime.
+#[tauri::command]
+async fn install_python_env(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let data_dir = state.data_dir.clone();
+    tokio::task::spawn_blocking(move || python_env::install(&app, &data_dir))
+        .await
+        .map_err(to_command_error)?
+        .map_err(to_command_error)
 }
 
 #[tauri::command]
@@ -444,7 +464,7 @@ async fn transcribe_project(
         "local" => {
             let has_whisper = transcription::whisper_cli_exists() || transcription::whisper_python_exists();
             if !has_whisper {
-                return Err("Whisper is not installed. Please install it (e.g., via Homebrew 'brew install whisper-cli' or via Python 'pip3 install openai-whisper').".to_string());
+                return Err("Whisper não está instalado. Abra as configurações e clique em \"Instalar Whisper\" para baixar as dependências Python automaticamente.".to_string());
             }
             let extract_app = app.clone();
             let audio_path = media::extract_audio(
@@ -1164,6 +1184,9 @@ pub fn run() {
                 .context("resolving app data directory")?;
             std::fs::create_dir_all(&data_dir).context("creating app data directory")?;
             std::fs::create_dir_all(data_dir.join("models")).context("creating models directory")?;
+            // Registered before anything can probe for Whisper: the managed
+            // venv is what transcription should prefer over system Python.
+            python_env::register_venv_dir(&data_dir);
             let db = Database::open(&data_dir.join("autoshorts.sqlite"))?;
             let media_server =
                 media_server::MediaServer::start().context("starting the media server")?;
@@ -1201,7 +1224,9 @@ pub fn run() {
             delete_project,
             rename_project,
             check_youtube_copyright,
-            download_youtube_video
+            download_youtube_video,
+            python_env_status,
+            install_python_env
         ])
         .run(tauri::generate_context!())
         .expect("error while running AutoShorts");

@@ -282,9 +282,33 @@ const targets = [
 
       // cmd.exe não roda com cwd UNC (caminho \\wsl.localhost\...), então o build
       // é disparado por um .cmd gravado no próprio staging do Windows.
+      // O staging guarda o próprio node_modules (o rsync o exclui). Ele fica
+      // desatualizado quando package-lock.json muda, então reinstalamos sempre
+      // que o lockfile for mais novo que a instalação registrada pelo npm.
+      const stagingLock = path.join(staging, 'package-lock.json');
+      const stagingInstallMark = path.join(staging, 'node_modules/.package-lock.json');
+      const stagingTauriCli = path.join(staging, 'node_modules/.bin/tauri.cmd');
+      const needsInstall =
+        !fs.existsSync(stagingTauriCli) ||
+        !fs.existsSync(stagingInstallMark) ||
+        (fs.existsSync(stagingLock) &&
+          fs.statSync(stagingLock).mtimeMs > fs.statSync(stagingInstallMark).mtimeMs);
+      info(
+        needsInstall
+          ? 'dependências do staging desatualizadas — rodando `npm ci` no Windows'
+          : 'dependências do staging atualizadas',
+      );
+
       const scriptPath = path.join(staging, 'build-autoshorts.cmd');
       const scriptWin = path.join(stagingWin, 'build-autoshorts.cmd');
       const bundleFlag = bundles ? ` -- --bundles ${bundles}` : '';
+      const installLines = needsInstall
+        ? [
+            'echo [build] instalando dependencias no Windows...',
+            'call npm ci --no-audit --no-fund',
+            'if errorlevel 1 exit /b 1',
+          ]
+        : [];
       fs.writeFileSync(
         scriptPath,
         [
@@ -292,13 +316,7 @@ const targets = [
           'setlocal',
           'cd /d "%~dp0"',
           `set "PATH=${[nodeWinDir, cargoBinWin].filter(Boolean).join(';')};%PATH%"`,
-          // `npm ci` só é necessário quando as dependências (e o binário do CLI
-          // do Tauri) ainda não existem no staging do Windows.
-          'if not exist "node_modules\\.bin\\tauri.cmd" (',
-          '  echo [build] instalando dependencias no Windows...',
-          '  call npm ci --no-audit --no-fund',
-          '  if errorlevel 1 exit /b 1',
-          ')',
+          ...installLines,
           `call npm run tauri:build${bundleFlag}`,
           'exit /b %errorlevel%',
           '',

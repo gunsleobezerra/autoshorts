@@ -139,6 +139,22 @@ type WhisperDownloadState = {
   percentage: number;
 };
 
+// Mirrors `python_env::PythonEnvStatus` on the Rust side: the app owns a venv
+// under its data dir so `openai-whisper` ships without a manual pip install.
+type PythonEnvStatus = {
+  ready: boolean;
+  venvCreated: boolean;
+  venvDir: string;
+  python: string | null;
+  systemPython: string | null;
+  whisperCli: string | null;
+};
+
+type PythonInstallState = {
+  status: string;
+  percentage: number;
+};
+
 type PipelineProgressState = {
   stage: string;
   label: string;
@@ -224,6 +240,8 @@ function App() {
   });
   const [whisperModels, setWhisperModels] = useState<WhisperModelInfo[]>([]);
   const [whisperDownload, setWhisperDownload] = useState<WhisperDownloadState | null>(null);
+  const [pythonEnv, setPythonEnv] = useState<PythonEnvStatus | null>(null);
+  const [pythonInstall, setPythonInstall] = useState<PythonInstallState | null>(null);
   const [pipelineProgress, setPipelineProgress] = useState<PipelineProgressState | null>(null);
   const pipelineHideTimer = useRef<number | null>(null);
 
@@ -412,6 +430,7 @@ function App() {
 
   useEffect(() => {
     void loadWhisperModels();
+    void loadPythonEnv();
   }, []);
 
   // Candidate thumbnails: extracted once per project (cached on disk) and
@@ -478,6 +497,48 @@ function App() {
       setWhisperModels(models);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  async function loadPythonEnv() {
+    try {
+      setPythonEnv(await invoke<PythonEnvStatus>("python_env_status"));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  // Provisions the app-managed venv and installs `openai-whisper` in it. The
+  // backend streams pip output through `python-env-progress`.
+  async function installPythonEnv() {
+    setError(null);
+    setPythonInstall({ status: "Preparando ambiente Python…", percentage: 0 });
+    let unlisten: (() => void) | undefined;
+    try {
+      unlisten = await listen<{ status: string; percentage?: number | null }>(
+        "python-env-progress",
+        (event) => {
+          const payload = event.payload;
+          setPythonInstall((previous) => ({
+            status: payload.status,
+            percentage:
+              payload.percentage !== undefined && payload.percentage !== null
+                ? Math.round(payload.percentage)
+                : previous?.percentage ?? 0,
+          }));
+        },
+      );
+
+      await invoke("install_python_env");
+      await Promise.all([loadPythonEnv(), loadWhisperModels()]);
+      setPythonInstall({ status: "Whisper instalado!", percentage: 100 });
+      setTimeout(() => setPythonInstall(null), 1500);
+      await refresh();
+    } catch (err) {
+      setPythonInstall(null);
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      unlisten?.();
     }
   }
 
@@ -621,7 +682,7 @@ function App() {
 
     if (transcriptionEngine === "local") {
       if (!env.hasLocalWhisperModel) {
-        setError("Import successful. Local Whisper is not installed. Run 'pip3 install -U openai-whisper' (or install whisper-cli) to start transcription.");
+        setError("Importação concluída. O Whisper local não está instalado. Abra as configurações e clique em \"Instalar Whisper\" para começar a transcrever.");
         return;
       }
     } else {
@@ -964,6 +1025,9 @@ function App() {
         downloadWhisperModel={downloadWhisperModel}
         loadWhisperModels={loadWhisperModels}
         whisperDownload={whisperDownload}
+        pythonEnv={pythonEnv}
+        pythonInstall={pythonInstall}
+        installPythonEnv={installPythonEnv}
         refreshEnv={() => refresh()}
       />
     );
@@ -1232,6 +1296,11 @@ function App() {
                   </div>
                   {transcriptionEngine === "local" && (
                     <div className="settings-whisper">
+                      <PythonEnvCard
+                        status={pythonEnv}
+                        installing={pythonInstall}
+                        onInstall={installPythonEnv}
+                      />
                       <WhisperModelList
                         models={whisperModels}
                         selected={whisperModel}
@@ -1241,12 +1310,6 @@ function App() {
                         downloading={whisperDownload}
                         disabled={!environment?.hasLocalWhisperModel}
                       />
-                      {!environment?.hasLocalWhisperModel && (
-                        <p className="whisper-hint">
-                          ⚠️ Python package 'openai-whisper' not detected. Run 'pip3 install -U openai-whisper'
-                          before downloading models.
-                        </p>
-                      )}
                     </div>
                   )}
                   <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: '16px', borderTop: '1px solid var(--border-color)', paddingTop: '16px' }}>
@@ -1295,7 +1358,7 @@ function App() {
                   {!canTranscribe && (
                     <div className="api-warning">
                       {transcriptionEngine === "local"
-                        ? `⚠️ Local Whisper (Python package 'openai-whisper') is not installed. Run 'pip3 install openai-whisper' in your terminal.`
+                        ? `⚠️ Local Whisper (pacote Python 'openai-whisper') não está instalado. Abra as configurações e clique em "Instalar Whisper".`
                         : "⚠️ Deepgram API Key is missing. Transcribing will not work. Please add your key in API Settings."}
                     </div>
                   )}
@@ -1781,6 +1844,69 @@ function App() {
   );
 }
 
+// Local Whisper needs a Python package (~1-2 GB with PyTorch). The app owns a
+// virtualenv under its data dir and installs into it, so no manual pip step is
+// required after installing AutoShorts.
+function PythonEnvCard({
+  status,
+  installing,
+  onInstall,
+}: {
+  status: PythonEnvStatus | null;
+  installing: PythonInstallState | null;
+  onInstall: () => Promise<void>;
+}) {
+  const busy = Boolean(installing);
+  const ready = Boolean(status?.ready);
+
+  return (
+    <div className={`python-env-card ${ready ? "ready" : ""}`}>
+      <div className="python-env-head">
+        <div>
+          <strong>Python / Whisper</strong>
+          <p>
+            {ready
+              ? "Ambiente gerenciado pronto — transcrição local habilitada."
+              : "Instala o openai-whisper em um ambiente isolado do app."}
+          </p>
+        </div>
+        {ready ? (
+          <span className="python-env-badge ready">
+            <BadgeCheck size={13} /> Pronto
+          </span>
+        ) : (
+          <button type="button" className="python-env-btn" disabled={busy} onClick={() => void onInstall()}>
+            {busy ? <Loader2 className="spin" size={14} /> : <Download size={14} />}
+            {busy ? "Instalando…" : "Instalar Whisper"}
+          </button>
+        )}
+      </div>
+
+      {installing && (
+        <div className="python-env-progress">
+          <div className="python-env-progress-bar">
+            <div style={{ width: `${Math.min(100, Math.max(0, installing.percentage))}%` }} />
+          </div>
+          <span className="python-env-status">{installing.status}</span>
+        </div>
+      )}
+
+      {!ready && !busy && !status?.systemPython && (
+        <p className="whisper-hint">
+          ⚠️ Python 3 não encontrado. Instale o Python (python.org no Windows,{" "}
+          <code>sudo apt install python3 python3-venv</code> no Debian/Ubuntu) e recarregue o app.
+        </p>
+      )}
+
+      {status?.venvDir && (
+        <p className="python-env-path" title={status.venvDir}>
+          {status.venvDir}
+        </p>
+      )}
+    </div>
+  );
+}
+
 function WhisperModelList({
   models,
   selected,
@@ -1801,8 +1927,7 @@ function WhisperModelList({
   return (
     <div className="whisper-models">
       <div className="whisper-models-header">
-        <span>Whisper Model</span>
-        <button type="button" className="whisper-refresh" onClick={() => void onRefresh()}>
+        <span>Whisper Model</span>        <button type="button" className="whisper-refresh" onClick={() => void onRefresh()}>
           <RefreshCw size={12} /> Refresh
         </button>
       </div>
@@ -1868,8 +1993,7 @@ function WhisperModelList({
 
 interface OnboardingProps {
   environment: EnvironmentStatus | null;
-  onComplete: () => void;
-  setTranscriptionEngine: (engine: "deepgram" | "local") => void;
+  onComplete: () => void;  setTranscriptionEngine: (engine: "deepgram" | "local") => void;
   setLlmEngine: (engine: "claude" | "deepseek" | "local" | "groq" | "openai-compatible") => void;
   setLocalLlmModel: (model: string) => void;
   setDeepgramKey: (key: string) => void;
@@ -1892,6 +2016,9 @@ interface OnboardingProps {
   downloadWhisperModel: (modelId: string) => Promise<void>;
   loadWhisperModels: () => Promise<void>;
   whisperDownload: WhisperDownloadState | null;
+  pythonEnv: PythonEnvStatus | null;
+  pythonInstall: PythonInstallState | null;
+  installPythonEnv: () => Promise<void>;
   refreshEnv: () => Promise<void>;
 }
 function Onboarding({
@@ -1913,6 +2040,9 @@ function Onboarding({
   downloadWhisperModel,
   loadWhisperModels,
   whisperDownload,
+  pythonEnv,
+  pythonInstall,
+  installPythonEnv,
   deepgramKey: initialDeepgramKey,
   anthropicKey: initialAnthropicKey,
   deepseekKey: initialDeepseekKey,
@@ -1941,13 +2071,6 @@ function Onboarding({
   const [downloadProgress, setDownloadProgress] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [checkingOllama, setCheckingOllama] = useState(false);
-  const [copied, setCopied] = useState(false);
-
-  const copyWhisperCommand = () => {
-    navigator.clipboard.writeText("pip3 install -U openai-whisper");
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
-  };
 
   const handleCloudSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -2118,19 +2241,17 @@ function Onboarding({
               <div className="setup-step">
                 <div className="step-num">1</div>
                 <div className="step-body">
-                  <h4>Install Python Whisper</h4>
-                  <p>Open your terminal and run the following command to install the transcription engine:</p>
-                  <div className="code-block-container">
-                    <code>pip3 install -U openai-whisper</code>
-                    <button type="button" className="copy-btn" onClick={copyWhisperCommand}>
-                      {copied ? <Check size={14} /> : <Copy size={14} />}
-                      {copied ? "Copied!" : "Copy"}
-                    </button>
-                  </div>
+                  <h4>Instalar Whisper</h4>
+                  <p>O AutoShorts baixa o <code>openai-whisper</code> em um ambiente Python isolado.</p>
+                  <PythonEnvCard
+                    status={pythonEnv}
+                    installing={pythonInstall}
+                    onInstall={installPythonEnv}
+                  />
                   {environment?.hasLocalWhisperModel ? (
-                    <span className="step-check success"><BadgeCheck size={14} /> Whisper installed in Python!</span>
+                    <span className="step-check success"><BadgeCheck size={14} /> Whisper instalado!</span>
                   ) : (
-                    <span className="step-check warning">⚠️ Python package 'whisper' not detected yet. Run the command above.</span>
+                    <span className="step-check warning">⚠️ Pacote Python 'whisper' ainda não detectado.</span>
                   )}
 
                   <div style={{ marginTop: "16px" }}>
@@ -2245,7 +2366,7 @@ function Onboarding({
                 <p className="form-help">
                   {environment?.hasLocalWhisperModel
                     ? "Local Whisper detected. Transcription will run on this machine."
-                    : "Local Whisper not detected. Run 'pip3 install -U openai-whisper' before importing media."}
+                    : "Local Whisper não detectado. Use \"Instalar Whisper\" nas configurações antes de importar mídia."}
                 </p>
               )}
 

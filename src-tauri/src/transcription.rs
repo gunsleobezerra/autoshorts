@@ -128,7 +128,7 @@ pub async fn download_whisper_model(app: tauri::AppHandle, model: String) -> Res
 
     if !whisper_python_exists() {
         return Err(anyhow!(
-            "Python package 'whisper' is not installed. Run 'pip3 install -U openai-whisper' first."
+            "O pacote Python 'whisper' não está instalado. Use \"Instalar Whisper\" nas configurações para baixá-lo automaticamente."
         ));
     }
 
@@ -372,6 +372,12 @@ pub fn build_segments(words: &[TranscriptWord]) -> Vec<TranscriptSegment> {
 }
 
 pub fn find_python_command() -> Option<String> {
+    // The managed venv wins: it is the only interpreter we control, so it keeps
+    // `import whisper` working after system Python upgrades.
+    if let Some(python) = crate::python_env::active_python() {
+        return Some(python.to_string_lossy().to_string());
+    }
+
     let candidates: &[&str] = if cfg!(windows) {
         &["python", "py", "python3"]
     } else {
@@ -394,37 +400,11 @@ pub fn find_python_command() -> Option<String> {
 }
 
 pub fn whisper_cli_exists() -> bool {
-    let candidates: &[&str] = if cfg!(windows) {
-        &["whisper", "whisper.exe"]
-    } else {
-        &["whisper"]
-    };
-
-    for &cmd in candidates {
-        if let Ok(out) = std::process::Command::new(cmd).arg("--help").output() {
-            if out.status.success() {
-                return true;
-            }
-        }
-    }
-    false
+    crate::python_env::active_whisper_cli().is_some()
 }
 
 pub fn whisper_python_exists() -> bool {
-    let candidates: &[&str] = if cfg!(windows) {
-        &["python", "py", "python3"]
-    } else {
-        &["python3", "python"]
-    };
-
-    for &cmd in candidates {
-        if let Ok(out) = std::process::Command::new(cmd).args(["-c", "import whisper"]).output() {
-            if out.status.success() {
-                return true;
-            }
-        }
-    }
-    false
+    crate::python_env::active_python().is_some()
 }
 
 fn normalize_whisper_raw_json(raw: serde_json::Value) -> Result<NormalizedTranscript> {
@@ -574,7 +554,11 @@ pub async fn transcribe_local(
         model_size.trim().to_string()
     };
 
-    if whisper_cli_exists() {
+    // On Windows the `whisper` console script prints every decoded segment to
+    // the piped stdout, and that write can raise `OSError [Errno 22] Invalid
+    // argument`, aborting the whole transcription. Our generated helper script
+    // hardens sys.stdout/sys.stderr against exactly that, so prefer it there.
+    if whisper_cli_exists() && !cfg!(windows) {
         let audio_path_buf = std::path::Path::new(&audio_path);
         let audio_dir = audio_path_buf.parent().ok_or_else(|| anyhow!("Invalid audio path parent"))?;
         let audio_stem = audio_path_buf.file_stem().ok_or_else(|| anyhow!("Invalid audio file stem"))?.to_string_lossy();
@@ -593,7 +577,10 @@ pub async fn transcribe_local(
             let device = crate::hardware::whisper_device();
 
             let build = |device: Option<&str>| {
-                let mut cmd = std::process::Command::new("whisper");
+                // Prefer the venv's console script over whatever is on PATH.
+                let cli = crate::python_env::active_whisper_cli()
+                    .unwrap_or_else(|| std::path::PathBuf::from("whisper"));
+                let mut cmd = std::process::Command::new(cli);
                 cmd.arg(&audio_path)
                     .args(["--model", &cli_model])
                     .args(["--output_format", "json"])
@@ -661,6 +648,47 @@ pub async fn transcribe_local(
 import json
 import whisper
 
+
+class _SafeStream:
+    """Best-effort writer that never aborts transcription.
+
+    whisper prints every decoded segment when verbose=True. On Windows that
+    write can raise OSError [Errno 22] "Invalid argument" (closed or
+    re-directed console handle), which killed the whole run. Progress output
+    is cosmetic, so swallow the error instead of failing.
+    """
+
+    def __init__(self, stream):
+        self._stream = stream
+
+    def write(self, data):
+        try:
+            return self._stream.write(data)
+        except (OSError, ValueError, UnicodeError):
+            return len(data)
+
+    def flush(self):
+        try:
+            self._stream.flush()
+        except (OSError, ValueError):
+            pass
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+def harden_streams():
+    for name in ("stdout", "stderr"):
+        stream = getattr(sys, name, None)
+        if stream is None:
+            continue
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+        setattr(sys, name, _SafeStream(stream))
+
+
 def load_model(model_name, device):
     """Load on the GPU when asked to, falling back to CPU on any failure."""
     if device:
@@ -674,6 +702,10 @@ def load_model(model_name, device):
     return whisper.load_model(model_name)
 
 def main():
+    # Must run before whisper prints anything: a broken stdout/stderr on
+    # Windows would otherwise raise OSError mid-transcription.
+    harden_streams()
+
     if len(sys.argv) < 3:
         print("Usage: transcribe.py <audio_path> <output_json_path> [model_name] [device]")
         sys.exit(1)
