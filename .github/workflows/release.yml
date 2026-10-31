@@ -53,8 +53,8 @@ jobs:
 
   release:
     # Only real version tags cut a release. On a push to `main` `github.ref_name`
-    # is literally "main", which used to create a bogus `main` tag/release.
-    if: github.event_name == 'push'
+    # is literally "main", which would create a bogus `main` tag/release.
+    if: startsWith(github.ref, 'refs/tags/v')
     needs: test
     permissions:
       contents: write
@@ -104,8 +104,13 @@ jobs:
           tauriScript: npm run tauri
           tagName: ${{ github.ref_name }}
           releaseName: 'AutoShorts ${{ github.ref_name }}'
-          releaseBody: 'See release notes for installation details.'
-          releaseDraft: true
+          # `releaseDraft: true` left every build stuck as a draft that was never
+          # published. Publish directly and let GitHub generate the notes from
+          # the commit history.
+          releaseDraft: false
           prerelease: false
+          generateReleaseNotes: true
+        
+        
 
  
